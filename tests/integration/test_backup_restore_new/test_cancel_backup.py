@@ -1,9 +1,10 @@
+import re
+import uuid
+
 import pytest
+
 from helpers.cluster import ClickHouseCluster
 from helpers.test_tools import TSV, assert_eq_with_retry
-import uuid
-import re
-
 
 cluster = ClickHouseCluster(__file__)
 
@@ -177,7 +178,7 @@ def cancel_restore(restore_id):
 def test_cancel_backup():
     # We use partitioning so backups would contain more files.
     node.query(
-        "CREATE TABLE tbl (x UInt64) ENGINE=MergeTree() ORDER BY tuple() PARTITION BY x%5"
+        "CREATE TABLE tbl (x UInt64) ENGINE=MergeTree() ORDER BY tuple() PARTITION BY x%20"
     )
 
     node.query(f"INSERT INTO tbl SELECT number FROM numbers(500)")

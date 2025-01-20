@@ -72,8 +72,8 @@ struct StorageInMemoryMetadata
     StorageInMemoryMetadata(const StorageInMemoryMetadata & other);
     StorageInMemoryMetadata & operator=(const StorageInMemoryMetadata & other);
 
-    StorageInMemoryMetadata(StorageInMemoryMetadata && other) = default;
-    StorageInMemoryMetadata & operator=(StorageInMemoryMetadata && other) = default;
+    StorageInMemoryMetadata(StorageInMemoryMetadata && other) = default; /// NOLINT(hicpp-noexcept-move,performance-noexcept-move-constructor)
+    StorageInMemoryMetadata & operator=(StorageInMemoryMetadata && other) = default; /// NOLINT(hicpp-noexcept-move,performance-noexcept-move-constructor)
 
     /// NOTE: Thread unsafe part. You should not modify same StorageInMemoryMetadata
     /// structure from different threads. It should be used as MultiVersion
@@ -184,6 +184,9 @@ struct StorageInMemoryMetadata
     /// Block with ordinary + materialized columns.
     Block getSampleBlock() const;
 
+    /// Block with ordinary + materialized columns + subcolumns.
+    Block getSampleBlockWithSubcolumns() const;
+
     /// Block with ordinary + ephemeral.
     Block getSampleBlockInsertable() const;
 
@@ -219,6 +222,9 @@ struct StorageInMemoryMetadata
     /// Returns columns names in sorting key specified by user in ORDER BY
     /// expression. For example: 'a', 'x * y', 'toStartOfMonth(date)', etc.
     Names getSortingKeyColumns() const;
+    /// Returns reverse indicators of columns in sorting key specified by user in ORDER BY
+    /// expression. For example: ('a' DESC, 'x * y', 'toStartOfMonth(date)' DESC) -> {1, 0, 1}.
+    std::vector<bool> getSortingKeyReverseFlags() const;
 
     /// Returns column names that need to be read for FINAL to work.
     Names getColumnsRequiredForFinal() const { return getColumnsRequiredForSortingKey(); }

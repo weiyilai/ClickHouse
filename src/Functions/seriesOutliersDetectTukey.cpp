@@ -45,13 +45,13 @@ public:
                 getName(),
                 arguments.size());
 
-        FunctionArgumentDescriptors mandatory_args{{"time_series", &isArray<IDataType>, nullptr, "Array"}};
+        FunctionArgumentDescriptors mandatory_args{{"time_series", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isArray), nullptr, "Array"}};
         FunctionArgumentDescriptors optional_args{
-            {"min_percentile", &isFloat<IDataType>, isColumnConst, "Number"},
-            {"max_percentile", &isFloat<IDataType>, isColumnConst, "Number"},
-            {"k", &isNativeNumber<IDataType>, isColumnConst, "Number"}};
+            {"min_percentile", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isFloat), isColumnConst, "Number"},
+            {"max_percentile", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isFloat), isColumnConst, "Number"},
+            {"k", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isNativeNumber), isColumnConst, "Number"}};
 
-        validateFunctionArgumentTypes(*this, arguments, mandatory_args, optional_args);
+        validateFunctionArguments(*this, arguments, mandatory_args, optional_args);
 
         return std::make_shared<DataTypeArray>(std::make_shared<DataTypeFloat64>());
     }
@@ -61,10 +61,10 @@ public:
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
         ColumnPtr col = arguments[0].column;
-        const ColumnArray * col_arr = checkAndGetColumn<ColumnArray>(col.get());
+        const ColumnArray & col_arr = checkAndGetColumn<ColumnArray>(*col);
 
-        const IColumn & arr_data = col_arr->getData();
-        const ColumnArray::Offsets & arr_offsets = col_arr->getOffsets();
+        const IColumn & arr_data = col_arr.getData();
+        const ColumnArray::Offsets & arr_offsets = col_arr.getOffsets();
 
         ColumnPtr col_res;
         if (input_rows_count == 0)
@@ -105,12 +105,8 @@ public:
         {
             return col_res;
         }
-        else
-            throw Exception(
-                ErrorCodes::ILLEGAL_COLUMN,
-                "Illegal column {} of first argument of function {}",
-                arguments[0].column->getName(),
-                getName());
+        throw Exception(
+            ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of first argument of function {}", arguments[0].column->getName(), getName());
     }
 
 private:
@@ -251,6 +247,6 @@ Result:
 │ [0,0,0,0,0,0,0,0,0,19.5,0,0,0,0,0,0] │
 └──────────────────────────────────────┘
 ```)",
-        .categories{"Time series analysis"}});
+        .category{"Time Series"}});
 }
 }

@@ -34,7 +34,8 @@ namespace MySQLReplication
     {
         payload.readStrict(to, n);
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-        char *start = to, *end = to + n;
+        char *start = to;
+        char *end = to + n;
         std::reverse(start, end);
 #endif
     }
@@ -119,7 +120,7 @@ namespace MySQLReplication
     {
         BINLOG_CHECKSUM_ALG_OFF = 0,
         BINLOG_CHECKSUM_ALG_CRC32 = 1,
-        BINLOG_CHECKSUM_ALG_ENUM_END,
+        BINLOG_CHECKSUM_ALG_ENUM_END = 3,
         BINLOG_CHECKSUM_ALG_UNDEF = 255
     };
 
@@ -546,7 +547,7 @@ namespace MySQLReplication
         virtual void setGTIDSets(GTIDSets sets) = 0;
         virtual void setChecksumSignatureLength(size_t checksum_signature_length_) = 0;
 
-        virtual ~IFlavor() override = default;
+        ~IFlavor() override = default;
     };
 
     class MySQLFlavor : public IFlavor

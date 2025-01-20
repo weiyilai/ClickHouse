@@ -6,7 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from build_download_helper import get_build_name_for_check, read_build_urls
+from build_download_helper import read_build_urls
+from ci_config import CI
 from docker_images_helper import get_docker_image, pull_image
 from env_helper import REPORT_PATH, TEMP_PATH
 from pr_info import PRInfo
@@ -49,18 +50,18 @@ def main():
 
     docker_image = pull_image(get_docker_image(IMAGE_NAME))
 
-    build_name = get_build_name_for_check(check_name)
+    build_name = CI.get_required_build_name(check_name)
     print(build_name)
     urls = read_build_urls(build_name, reports_path)
     if not urls:
-        raise Exception("No build URLs found")
+        raise ValueError("No build URLs found")
 
     for url in urls:
         if url.endswith("/clickhouse"):
             build_url = url
             break
     else:
-        raise Exception("Cannot find the clickhouse binary among build results")
+        raise ValueError("Cannot find the clickhouse binary among build results")
 
     logging.info("Got build url %s", build_url)
 
@@ -85,17 +86,18 @@ def main():
                 logging.info("Run failed")
 
     subprocess.check_call(f"sudo chown -R ubuntu:ubuntu {temp_path}", shell=True)
+    report_file_path = workspace_path / "report.html"
 
     paths = {
         "run.log": run_log_path,
         "server.log.zst": workspace_path / "server.log.zst",
         "server.err.log.zst": workspace_path / "server.err.log.zst",
-        "report.html": workspace_path / "report.html",
+        "report.html": report_file_path,
         "test.log": workspace_path / "test.log",
     }
     status = SUCCESS
     description = "See the report"
-    test_results = [TestResult(description, "OK")]
+    test_results = [TestResult(description, "OK", log_files=[report_file_path])]
 
     JobReport(
         description=description,

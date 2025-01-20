@@ -74,8 +74,6 @@ public:
 
     bool supportsFinal() const override { return true; }
 
-    NamesAndTypesList getVirtuals() const override;
-
     void checkTableCanBeDropped([[ maybe_unused ]] ContextPtr query_context) const override;
 
     void drop() override;
@@ -120,7 +118,7 @@ public:
         return 0;
     }
 
-    void writeBlock(const Block & block, ContextPtr context);
+    void writeBlock(StorageLiveView & live_view, Block && block, Chunk::ChunkInfoCollection && chunk_infos, ContextPtr context);
 
     void refresh();
 

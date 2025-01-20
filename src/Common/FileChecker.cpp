@@ -10,6 +10,8 @@
 #include <IO/ReadHelpers.h>
 #include <base/JSON.h>
 
+#include <boost/range/adaptor/map.hpp>
+
 
 namespace fs = std::filesystem;
 
@@ -174,7 +176,7 @@ void FileChecker::load()
     if (!fileReallyExists(files_info_path))
         return;
 
-    std::unique_ptr<ReadBuffer> in = disk ? disk->readFile(files_info_path) : std::make_unique<ReadBufferFromFile>(files_info_path);
+    std::unique_ptr<ReadBuffer> in = disk ? disk->readFile(files_info_path, getReadSettings()) : std::make_unique<ReadBufferFromFile>(files_info_path);
     WriteBufferFromOwnString out;
 
     /// The JSON library does not support whitespace. We delete them. Inefficient.
@@ -194,7 +196,7 @@ void FileChecker::load()
 
 bool FileChecker::fileReallyExists(const String & path_) const
 {
-    return disk ? disk->exists(path_) : fs::exists(path_);
+    return disk ? disk->existsFile(path_) : fs::exists(path_);
 }
 
 size_t FileChecker::getRealFileSize(const String & path_) const

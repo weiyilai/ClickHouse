@@ -2,8 +2,9 @@
 #include "Commands.h"
 #include <Client/ReplxxLineReader.h>
 #include <Client/ClientBase.h>
-#include "Common/VersionNumber.h"
+#include <Common/VersionNumber.h>
 #include <Common/Config/ConfigProcessor.h>
+#include <Client/ClientApplicationBase.h>
 #include <Common/EventNotifier.h>
 #include <Common/filesystemHelpers.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
@@ -34,6 +35,7 @@ String KeeperClient::executeFourLetterCommand(const String & command)
 
     out.write(command.data(), command.size());
     out.next();
+    out.finalize();
 
     String result;
     readStringUntilEOF(result, in);
@@ -44,7 +46,7 @@ String KeeperClient::executeFourLetterCommand(const String & command)
 std::vector<String> KeeperClient::getCompletions(const String & prefix) const
 {
     Tokens tokens(prefix.data(), prefix.data() + prefix.size(), 0, false);
-    IParser::Pos pos(tokens, 0);
+    IParser::Pos pos(tokens, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
 
     if (pos->type != TokenType::BareWord)
         return registered_commands_and_four_letter_words;
@@ -86,7 +88,10 @@ std::vector<String> KeeperClient::getCompletions(const String & prefix) const
 void KeeperClient::askConfirmation(const String & prompt, std::function<void()> && callback)
 {
     if (!ask_confirmation)
-        return callback();
+    {
+        callback();
+        return;
+    }
 
     std::cout << prompt << " Continue?\n";
     waiting_confirmation = true;
@@ -141,6 +146,11 @@ void KeeperClient::defineOptions(Poco::Util::OptionSet & options)
             .binding("port"));
 
     options.addOption(
+        Poco::Util::Option("password", "", "password to connect to keeper server")
+            .argument("<password>")
+            .binding("password"));
+
+    options.addOption(
         Poco::Util::Option("query", "q", "will execute given query, then exit.")
             .argument("<query>")
             .binding("query"));
@@ -159,6 +169,10 @@ void KeeperClient::defineOptions(Poco::Util::OptionSet & options)
         Poco::Util::Option("operation-timeout", "", "set operation timeout in seconds. default 10s.")
             .argument("<seconds>")
             .binding("operation-timeout"));
+
+    options.addOption(
+        Poco::Util::Option("use-xid-64", "", "use 64-bit XID. default false.")
+            .binding("use-xid-64"));
 
     options.addOption(
         Poco::Util::Option("config-file", "c", "if set, will try to get a connection string from clickhouse config. default `config.xml`")
@@ -209,6 +223,8 @@ void KeeperClient::initialize(Poco::Util::Application & /* self */)
         std::make_shared<FourLetterWordCommand>(),
         std::make_shared<GetDirectChildrenNumberCommand>(),
         std::make_shared<GetAllChildrenNumberCommand>(),
+        std::make_shared<CPCommand>(),
+        std::make_shared<MVCommand>(),
     });
 
     String home_path;
@@ -233,6 +249,8 @@ void KeeperClient::initialize(Poco::Util::Application & /* self */)
                 throw;
         }
     }
+
+    history_max_entries = config().getUInt("history-max-entries", 1000000);
 
     String default_log_level;
     if (config().has("query"))
@@ -278,6 +296,7 @@ bool KeeperClient::processQueryText(const String & text)
                 /* allow_multi_statements = */ true,
                 /* max_query_size = */ 0,
                 /* max_parser_depth = */ 0,
+                /* max_parser_backtracks = */ 0,
                 /* skip_insignificant = */ false);
 
             if (!res)
@@ -309,11 +328,14 @@ void KeeperClient::runInteractiveReplxx()
     ReplxxLineReader lr(
         suggest,
         history_file,
+        history_max_entries,
         /* multiline= */ false,
+        /* ignore_shell_suspend= */ false,
         query_extenders,
         query_delimiters,
         word_break_characters,
-        /* highlighter_= */ {});
+        /* highlighter_= */ {}
+    );
     lr.enableBracketedPaste();
 
     while (true)
@@ -364,10 +386,10 @@ int KeeperClient::main(const std::vector<String> & /* args */)
         return 0;
     }
 
-    DB::ConfigProcessor config_processor(config().getString("config-file", "config.xml"));
+    ConfigProcessor config_processor(config().getString("config-file", "config.xml"));
 
     /// This will handle a situation when clickhouse is running on the embedded config, but config.d folder is also present.
-    config_processor.registerEmbeddedConfig("config.xml", "<clickhouse/>");
+    ConfigProcessor::registerEmbeddedConfig("config.xml", "<clickhouse/>");
     auto clickhouse_config = config_processor.loadConfig();
 
     Poco::Util::AbstractConfiguration::Keys keys;
@@ -379,6 +401,9 @@ int KeeperClient::main(const std::vector<String> & /* args */)
 
         for (const auto & key : keys)
         {
+            if (key != "node")
+                continue;
+
             String prefix = "zookeeper." + key;
             String host = clickhouse_config.configuration->getString(prefix + ".host");
             String port = clickhouse_config.configuration->getString(prefix + ".port");
@@ -397,9 +422,12 @@ int KeeperClient::main(const std::vector<String> & /* args */)
         zk_args.hosts.push_back(host + ":" + port);
     }
 
+    zk_args.availability_zones.resize(zk_args.hosts.size());
     zk_args.connection_timeout_ms = config().getInt("connection-timeout", 10) * 1000;
     zk_args.session_timeout_ms = config().getInt("session-timeout", 10) * 1000;
     zk_args.operation_timeout_ms = config().getInt("operation-timeout", 10) * 1000;
+    zk_args.use_xid_64 = config().hasOption("use-xid-64");
+    zk_args.password = config().getString("password", "");
     zookeeper = zkutil::ZooKeeper::createWithoutKillingPreviousSessions(zk_args);
 
     if (config().has("no-confirmation") || config().has("query"))
@@ -429,7 +457,8 @@ int mainEntryClickHouseKeeperClient(int argc, char ** argv)
     catch (const DB::Exception & e)
     {
         std::cerr << DB::getExceptionMessage(e, false) << std::endl;
-        return 1;
+        auto code = DB::getCurrentExceptionCode();
+        return static_cast<UInt8>(code) ? code : 1;
     }
     catch (const boost::program_options::error & e)
     {
@@ -439,6 +468,7 @@ int mainEntryClickHouseKeeperClient(int argc, char ** argv)
     catch (...)
     {
         std::cerr << DB::getCurrentExceptionMessage(true) << std::endl;
-        return 1;
+        auto code = DB::getCurrentExceptionCode();
+        return static_cast<UInt8>(code) ? code : 1;
     }
 }

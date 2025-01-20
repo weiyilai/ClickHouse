@@ -1,4 +1,3 @@
-#include <algorithm>
 #include <functional>
 #include <iterator>
 #include <Analyzer/ConstantNode.h>
@@ -10,13 +9,13 @@
 #include <Analyzer/QueryTreeBuilder.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/Utils.h>
+#include <Common/quoteString.h>
 #include <Columns/ColumnSet.h>
 #include <Columns/ColumnString.h>
-#include <Core/SortDescription.h>
+#include <Core/Settings.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/getLeastSupertype.h>
 #include <DataTypes/IDataType.h>
-#include <Databases/IDatabase.h>
-#include <IO/WriteBufferFromString.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/IdentifierSemantic.h>
@@ -27,21 +26,22 @@
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/getHeaderForProcessingStage.h>
 #include <Interpreters/replaceAliasColumnsInQuery.h>
+#include <Interpreters/addMissingDefaults.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTSelectQuery.h>
+#include <Parsers/queryToString.h>
 #include <Planner/PlannerActionsVisitor.h>
 #include <Planner/Utils.h>
-#include <Processors/ConcatProcessor.h>
 #include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <Processors/QueryPlan/FilterStep.h>
+#include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/ReadFromMergeTree.h>
 #include <Processors/Sources/NullSource.h>
-#include <Processors/Sources/SourceFromSingleChunk.h>
-#include <Processors/Transforms/ExpressionTransform.h>
 #include <Processors/Transforms/FilterTransform.h>
 #include <Processors/Transforms/MaterializingTransform.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
@@ -54,8 +54,6 @@
 #include <Storages/StorageView.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Storages/checkAndGetLiteralArgument.h>
-#include <base/defines.h>
-#include <base/range.h>
 #include <Common/Exception.h>
 #include <Common/assert_cast.h>
 #include <Common/checkStackSize.h>
@@ -63,8 +61,16 @@
 #include <Core/NamesAndTypes.h>
 #include <Functions/FunctionFactory.h>
 
+
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool allow_experimental_analyzer;
+    extern const SettingsSeconds lock_acquire_timeout;
+    extern const SettingsFloat max_streams_multiplier_for_merge_tables;
+    extern const SettingsUInt64 merge_table_max_tables_to_look_for_schema_inference;
+}
 
 namespace
 {
@@ -73,6 +79,7 @@ bool columnIsPhysical(ColumnDefaultKind kind)
 {
     return kind == ColumnDefaultKind::Default || kind == ColumnDefaultKind::Materialized;
 }
+
 bool columnDefaultKindHasSameType(ColumnDefaultKind lhs, ColumnDefaultKind rhs)
 {
     if (lhs == rhs)
@@ -144,9 +151,12 @@ StorageMerge::StorageMerge(
         source_databases_and_tables_)
 {
     StorageInMemoryMetadata storage_metadata;
-    storage_metadata.setColumns(columns_.empty() ? getColumnsDescriptionFromSourceTables() : columns_);
+    storage_metadata.setColumns(columns_.empty()
+        ? getColumnsDescriptionFromSourceTables(context_->getSettingsRef()[Setting::merge_table_max_tables_to_look_for_schema_inference])
+        : columns_);
     storage_metadata.setComment(comment);
     setInMemoryMetadata(storage_metadata);
+    setVirtuals(createVirtuals());
 }
 
 StorageMerge::StorageMerge(
@@ -166,9 +176,12 @@ StorageMerge::StorageMerge(
         source_table_regexp_, {})
 {
     StorageInMemoryMetadata storage_metadata;
-    storage_metadata.setColumns(columns_.empty() ? getColumnsDescriptionFromSourceTables() : columns_);
+    storage_metadata.setColumns(columns_.empty()
+        ? getColumnsDescriptionFromSourceTables(context_->getSettingsRef()[Setting::merge_table_max_tables_to_look_for_schema_inference])
+        : columns_);
     storage_metadata.setComment(comment);
     setInMemoryMetadata(storage_metadata);
+    setVirtuals(createVirtuals());
 }
 
 StorageMerge::DatabaseTablesIterators StorageMerge::getDatabaseIterators(ContextPtr context_) const
@@ -176,12 +189,56 @@ StorageMerge::DatabaseTablesIterators StorageMerge::getDatabaseIterators(Context
     return database_name_or_regexp.getDatabaseIterators(context_);
 }
 
-ColumnsDescription StorageMerge::getColumnsDescriptionFromSourceTables() const
+ColumnsDescription StorageMerge::unifyColumnsDescription(std::function<void(std::function<void(const StoragePtr &)>)> for_each_table)
 {
-    auto table = getFirstTable([](auto && t) { return t; });
-    if (!table)
+    ColumnsDescription res;
+
+    for_each_table([&res](auto && t)
+    {
+        auto structure = t->getInMemoryMetadataPtr()->getColumns();
+        String prev_column_name;
+        for (const ColumnDescription & column : structure)
+        {
+            if (!res.has(column.name))
+            {
+                res.add(column, prev_column_name);
+            }
+            else if (column != res.get(column.name))
+            {
+                res.modify(column.name, [&column](ColumnDescription & what)
+                {
+                    what.type = getLeastSupertypeOrVariant(DataTypes{what.type, column.type});
+                    if (what.default_desc != column.default_desc)
+                        what.default_desc = {};
+                });
+            }
+            prev_column_name = column.name;
+        }
+    });
+
+    if (res.empty())
         throw Exception{ErrorCodes::CANNOT_EXTRACT_TABLE_STRUCTURE, "There are no tables satisfied provided regexp, you must specify table structure manually"};
-    return table->getInMemoryMetadataPtr()->getColumns();
+
+    return res;
+}
+
+ColumnsDescription StorageMerge::getColumnsDescriptionFromSourceTables(size_t max_tables_to_look) const
+{
+    size_t table_num = 0;
+
+    return unifyColumnsDescription([&table_num, max_tables_to_look, this](std::function<void(const StoragePtr &)> callback)
+    {
+        getFirstTable([&table_num, &callback, max_tables_to_look](auto && t)
+        {
+            if (!t)
+                return false;
+
+            callback(t);
+
+            ++table_num;
+            return table_num >= max_tables_to_look;
+        });
+    });
 }
 
 template <typename F>
@@ -210,6 +267,7 @@ void StorageMerge::forEachTable(F && func) const
     getFirstTable([&func](const auto & table)
     {
         func(table);
+        /// Always continue to the next table.
         return false;
     });
 }
@@ -220,9 +278,14 @@ bool StorageMerge::isRemote() const
     return first_remote_table != nullptr;
 }
 
-bool StorageMerge::tableSupportsPrewhere() const
+bool StorageMerge::supportsPrewhere() const
 {
-    /// NOTE: This check is used during query analysis as condition for applying
+    return getFirstTable([](const auto & table) { return !table->supportsPrewhere(); }) == nullptr;
+}
+
+bool StorageMerge::canMoveConditionsToPrewhere() const
+{
+    /// NOTE: This check and the above check are used during query analysis as condition for applying
     /// "move to PREWHERE" optimization. However, it contains a logical race:
     /// If new table that matches regexp for current storage and doesn't support PREWHERE
     /// will appear after this check and before calling "read" method, the optimized query may fail.
@@ -321,6 +384,37 @@ QueryProcessingStage::Enum StorageMerge::getQueryProcessingStage(
     return selected_table_size == 1 ? stage_in_source_tables : std::min(stage_in_source_tables, QueryProcessingStage::WithMergeableState);
 }
 
+VirtualColumnsDescription StorageMerge::createVirtuals()
+{
+    VirtualColumnsDescription desc;
+
+    desc.addEphemeral("_database", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "");
+    desc.addEphemeral("_table", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "");
+
+    return desc;
+}
+
+StorageSnapshotPtr StorageMerge::getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr) const
+{
+    static const auto common_virtuals = createVirtuals();
+
+    auto virtuals = common_virtuals;
+    if (auto first_table = getFirstTable([](auto && table) { return table; }))
+    {
+        auto table_virtuals = first_table->getVirtualsPtr();
+        for (const auto & column : *table_virtuals)
+        {
+            if (virtuals.has(column.name))
+                continue;
+
+            virtuals.add(column);
+        }
+    }
+
+    auto virtuals_ptr = std::make_shared<VirtualColumnsDescription>(std::move(virtuals));
+    return std::make_shared<StorageSnapshot>(*this, metadata_snapshot, std::move(virtuals_ptr));
+}
+
 void StorageMerge::read(
     QueryPlan & query_plan,
     const Names & column_names,
@@ -333,6 +427,14 @@ void StorageMerge::read(
 {
     /// What will be result structure depending on query processed stage in source tables?
     Block common_header = getHeaderForProcessingStage(column_names, storage_snapshot, query_info, local_context, processed_stage);
+
+    if (local_context->getSettingsRef()[Setting::allow_experimental_analyzer] && processed_stage == QueryProcessingStage::Complete)
+    {
+        /// Remove constants.
+        /// For StorageDistributed some functions like `hostName` that are constants only for local queries.
+        for (auto & column : common_header)
+            column.column = column.column->convertToFullColumnIfConst();
+    }
 
     auto step = std::make_unique<ReadFromMerge>(
         column_names,
@@ -358,7 +460,7 @@ ReadFromMerge::ReadFromMerge(
     size_t num_streams,
     StoragePtr storage,
     QueryProcessingStage::Enum processed_stage)
-    : SourceStepWithFilter(DataStream{.header = common_header_}, column_names_, query_info_, storage_snapshot_, context_)
+    : SourceStepWithFilter(common_header_, column_names_, query_info_, storage_snapshot_, context_)
     , required_max_block_size(max_block_size)
     , requested_num_streams(num_streams)
     , common_header(std::move(common_header_))
@@ -369,10 +471,14 @@ ReadFromMerge::ReadFromMerge(
 {
 }
 
-void ReadFromMerge::updatePrewhereInfo(const PrewhereInfoPtr & prewhere_info_value)
+void ReadFromMerge::addFilter(FilterDAGInfo filter)
 {
-    SourceStepWithFilter::updatePrewhereInfo(prewhere_info_value);
-    common_header = applyPrewhereActions(common_header, prewhere_info);
+    output_header = FilterTransform::transformHeader(
+            *output_header,
+            &filter.actions,
+            filter.column_name,
+            filter.do_remove_column);
+    pushed_down_filters.push_back(std::move(filter));
 }
 
 void ReadFromMerge::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
@@ -381,7 +487,7 @@ void ReadFromMerge::initializePipeline(QueryPipelineBuilder & pipeline, const Bu
 
     if (selected_tables.empty())
     {
-        pipeline.init(Pipe(std::make_shared<NullSource>(output_stream->header)));
+        pipeline.init(Pipe(std::make_shared<NullSource>(*output_header)));
         return;
     }
 
@@ -389,6 +495,7 @@ void ReadFromMerge::initializePipeline(QueryPipelineBuilder & pipeline, const Bu
     std::vector<std::unique_ptr<QueryPipelineBuilder>> pipelines;
 
     auto table_it = selected_tables.begin();
+    auto modified_context = Context::createCopy(context);
     for (size_t i = 0; i < selected_tables.size(); ++i, ++table_it)
     {
         auto & child_plan = child_plans->at(i);
@@ -396,26 +503,12 @@ void ReadFromMerge::initializePipeline(QueryPipelineBuilder & pipeline, const Bu
 
         const auto storage = std::get<1>(table);
         const auto storage_metadata_snapshot = storage->getInMemoryMetadataPtr();
-        const auto nested_storage_snaphsot = storage->getStorageSnapshot(storage_metadata_snapshot, context);
+        const auto nested_storage_snapshot = storage->getStorageSnapshot(storage_metadata_snapshot, context);
 
         Names column_names_as_aliases;
         Aliases aliases;
 
-        Names real_column_names = column_names;
-        if (child_plan.row_policy_data_opt)
-            child_plan.row_policy_data_opt->extendNames(real_column_names);
-
-        auto modified_query_info = getModifiedQueryInfo(context, table, nested_storage_snaphsot, real_column_names, column_names_as_aliases, aliases);
-
-        auto source_pipeline = createSources(
-            child_plan.plan,
-            nested_storage_snaphsot,
-            modified_query_info,
-            common_processed_stage,
-            common_header,
-            child_plan.table_aliases,
-            child_plan.row_policy_data_opt,
-            table);
+        auto source_pipeline = buildPipeline(child_plan, common_processed_stage);
 
         if (source_pipeline && source_pipeline->initialized())
         {
@@ -428,7 +521,7 @@ void ReadFromMerge::initializePipeline(QueryPipelineBuilder & pipeline, const Bu
 
     if (pipelines.empty())
     {
-        pipeline.init(Pipe(std::make_shared<NullSource>(output_stream->header)));
+        pipeline.init(Pipe(std::make_shared<NullSource>(*output_header)));
         return;
     }
 
@@ -438,8 +531,7 @@ void ReadFromMerge::initializePipeline(QueryPipelineBuilder & pipeline, const Bu
     {
         size_t tables_count = selected_tables.size();
         Float64 num_streams_multiplier = std::min(
-            static_cast<size_t>(tables_count),
-            std::max(1UL, static_cast<size_t>(context->getSettingsRef().max_streams_multiplier_for_merge_tables)));
+            tables_count, std::max(1UL, static_cast<size_t>(context->getSettingsRef()[Setting::max_streams_multiplier_for_merge_tables])));
         size_t num_streams = static_cast<size_t>(requested_num_streams * num_streams_multiplier);
 
         // It's possible to have many tables read from merge, resize(num_streams) might open too many files at the same time.
@@ -472,7 +564,6 @@ void ReadFromMerge::filterTablesAndCreateChildrenPlans()
     }
 
     selected_tables = getSelectedTables(context, has_database_virtual_column, has_table_virtual_column);
-
     child_plans = createChildrenPlans(query_info);
 }
 
@@ -485,7 +576,7 @@ std::vector<ReadFromMerge::ChildPlan> ReadFromMerge::createChildrenPlans(SelectQ
 
     size_t tables_count = selected_tables.size();
     Float64 num_streams_multiplier
-        = std::min(static_cast<size_t>(tables_count), std::max(1UL, static_cast<size_t>(context->getSettingsRef().max_streams_multiplier_for_merge_tables)));
+        = std::min(tables_count, std::max(1UL, static_cast<size_t>(context->getSettingsRef()[Setting::max_streams_multiplier_for_merge_tables])));
     size_t num_streams = static_cast<size_t>(requested_num_streams * num_streams_multiplier);
     size_t remaining_streams = num_streams;
 
@@ -514,9 +605,10 @@ std::vector<ReadFromMerge::ChildPlan> ReadFromMerge::createChildrenPlans(SelectQ
     }
 
     /// Settings will be modified when planning children tables.
-    auto modified_context = Context::createCopy(context);
     for (const auto & table : selected_tables)
     {
+        auto modified_context = Context::createCopy(context);
+
         size_t current_need_streams = tables_count >= num_streams ? 1 : (num_streams / tables_count);
         size_t current_streams = std::min(current_need_streams, remaining_streams);
         remaining_streams -= current_streams;
@@ -532,36 +624,34 @@ std::vector<ReadFromMerge::ChildPlan> ReadFromMerge::createChildrenPlans(SelectQ
         if (sampling_requested && !storage->supportsSampling())
             throw Exception(ErrorCodes::SAMPLING_NOT_SUPPORTED, "Illegal SAMPLE: table {} doesn't support sampling", storage->getStorageID().getNameForLogs());
 
-        res.emplace_back();
-
-        auto & aliases = res.back().table_aliases;
-        auto & row_policy_data_opt = res.back().row_policy_data_opt;
+        Aliases aliases;
+        RowPolicyDataOpt row_policy_data_opt;
         auto storage_metadata_snapshot = storage->getInMemoryMetadataPtr();
-        auto nested_storage_snaphsot = storage->getStorageSnapshot(storage_metadata_snapshot, context);
+        auto nested_storage_snapshot = storage->getStorageSnapshot(storage_metadata_snapshot, modified_context);
 
         Names column_names_as_aliases;
         Names real_column_names = column_names;
 
         const auto & database_name = std::get<0>(table);
         const auto & table_name = std::get<3>(table);
-        auto row_policy_filter_ptr = context->getRowPolicyFilter(
+        auto row_policy_filter_ptr = modified_context->getRowPolicyFilter(
             database_name,
             table_name,
             RowPolicyFilterType::SELECT_FILTER);
-        if (row_policy_filter_ptr)
+        if (row_policy_filter_ptr && !row_policy_filter_ptr->empty())
         {
-            row_policy_data_opt = RowPolicyData(row_policy_filter_ptr, storage, context);
+            row_policy_data_opt = RowPolicyData(row_policy_filter_ptr, storage, modified_context);
             row_policy_data_opt->extendNames(real_column_names);
         }
 
         auto modified_query_info
-            = getModifiedQueryInfo(context, table, nested_storage_snaphsot, real_column_names, column_names_as_aliases, aliases);
+            = getModifiedQueryInfo(modified_context, table, nested_storage_snapshot, real_column_names, column_names_as_aliases, aliases);
 
-        if (!context->getSettingsRef().allow_experimental_analyzer)
+        if (!context->getSettingsRef()[Setting::allow_experimental_analyzer])
         {
             auto storage_columns = storage_metadata_snapshot->getColumns();
             auto syntax_result = TreeRewriter(context).analyzeSelect(
-                modified_query_info.query, TreeRewriterResult({}, storage, nested_storage_snaphsot));
+                modified_query_info.query, TreeRewriterResult({}, storage, nested_storage_snapshot));
 
             bool with_aliases = common_processed_stage == QueryProcessingStage::FetchColumns && !storage_columns.getAliases().empty();
             if (with_aliases)
@@ -569,7 +659,7 @@ std::vector<ReadFromMerge::ChildPlan> ReadFromMerge::createChildrenPlans(SelectQ
                 ASTPtr required_columns_expr_list = std::make_shared<ASTExpressionList>();
                 ASTPtr column_expr;
 
-                auto sample_block = merge_storage_snapshot->getMetadataForQuery()->getSampleBlock();
+                auto sample_block = merge_storage_snapshot->metadata->getSampleBlock();
 
                 for (const auto & column : real_column_names)
                 {
@@ -604,30 +694,53 @@ std::vector<ReadFromMerge::ChildPlan> ReadFromMerge::createChildrenPlans(SelectQ
 
                 auto alias_actions = ExpressionAnalyzer(required_columns_expr_list, syntax_result, context).getActionsDAG(true);
 
-                column_names_as_aliases = alias_actions->getRequiredColumns().getNames();
+                column_names_as_aliases = alias_actions.getRequiredColumns().getNames();
                 if (column_names_as_aliases.empty())
                     column_names_as_aliases.push_back(ExpressionActions::getSmallestColumn(storage_metadata_snapshot->getColumns().getAllPhysical()).name);
             }
         }
-        else
-        {
 
-        }
+        Names column_names_to_read = column_names_as_aliases.empty() ? std::move(real_column_names) : std::move(column_names_as_aliases);
 
-        res.back().plan = createPlanForTable(
-            nested_storage_snaphsot,
+        std::erase_if(column_names_to_read, [existing_columns = nested_storage_snapshot->getAllColumnsDescription()](const auto & column_name){ return !existing_columns.has(column_name); });
+
+        auto child = createPlanForTable(
+            nested_storage_snapshot,
             modified_query_info,
             common_processed_stage,
             required_max_block_size,
             table,
-            column_names_as_aliases.empty() ? std::move(real_column_names) : std::move(column_names_as_aliases),
+            column_names_to_read,
             row_policy_data_opt,
             modified_context,
             current_streams);
-    }
 
-    if (!res.empty())
-        res[0].plan.addInterpreterContext(modified_context);
+        child.plan.addInterpreterContext(modified_context);
+
+        if (child.plan.isInitialized())
+        {
+            addVirtualColumns(child, modified_query_info, common_processed_stage, table);
+
+            /// Source tables could have different but convertible types, like numeric types of different width.
+            /// We must return streams with structure equals to structure of Merge table.
+            convertAndFilterSourceStream(common_header, modified_query_info, nested_storage_snapshot, aliases, row_policy_data_opt, context, child);
+
+            for (const auto & filter_info : pushed_down_filters)
+            {
+                auto filter_step = std::make_unique<FilterStep>(
+                    child.plan.getCurrentHeader(),
+                    filter_info.actions.clone(),
+                    filter_info.column_name,
+                    filter_info.do_remove_column);
+
+                child.plan.addStep(std::move(filter_step));
+            }
+
+            child.plan.optimize(QueryPlanOptimizationSettings(modified_context));
+        }
+
+        res.emplace_back(std::move(child));
+    }
 
     return res;
 }
@@ -644,12 +757,13 @@ public:
 
     void visitImpl(QueryTreeNodePtr & node)
     {
-        if (auto * column = node->as<ColumnNode>(); column != nullptr)
+        if (auto * column = node->as<ColumnNode>())
         {
             if (column->hasExpression())
             {
-                node = column->getExpressionOrThrow();
-                node->setAlias(column->getColumnName());
+                QueryTreeNodePtr column_expression = column->getExpressionOrThrow();
+                column_expression->setAlias(column->getColumnName());
+                node = std::move(column_expression);
             }
             else
                 column->setColumnSource(replacement_table_expression);
@@ -830,7 +944,7 @@ QueryTreeNodePtr replaceTableExpressionAndRemoveJoin(
 
 }
 
-SelectQueryInfo ReadFromMerge::getModifiedQueryInfo(const ContextPtr & modified_context,
+SelectQueryInfo ReadFromMerge::getModifiedQueryInfo(const ContextMutablePtr & modified_context,
     const StorageWithLockAndName & storage_with_lock_and_name,
     const StorageSnapshotPtr & storage_snapshot_,
     Names required_column_names,
@@ -841,12 +955,16 @@ SelectQueryInfo ReadFromMerge::getModifiedQueryInfo(const ContextPtr & modified_
     const StorageID current_storage_id = storage->getStorageID();
 
     SelectQueryInfo modified_query_info = query_info;
-    if (modified_query_info.optimized_prewhere_info && !modified_query_info.prewhere_info)
-        modified_query_info.prewhere_info = modified_query_info.optimized_prewhere_info;
+
+    modified_query_info.merge_storage_snapshot = merge_storage_snapshot;
+
+    if (modified_query_info.planner_context)
+        modified_query_info.planner_context = std::make_shared<PlannerContext>(modified_context, modified_query_info.planner_context);
 
     if (modified_query_info.table_expression)
     {
         auto replacement_table_expression = std::make_shared<TableNode>(storage, storage_lock, storage_snapshot_);
+        replacement_table_expression->setAlias(modified_query_info.table_expression->getAlias());
         if (query_info.table_expression_modifiers)
             replacement_table_expression->setTableExpressionModifiers(*query_info.table_expression_modifiers);
 
@@ -854,26 +972,41 @@ SelectQueryInfo ReadFromMerge::getModifiedQueryInfo(const ContextPtr & modified_
         modified_query_info.table_expression = replacement_table_expression;
         modified_query_info.planner_context->getOrCreateTableExpressionData(replacement_table_expression);
 
-        auto get_column_options = GetColumnsOptions(GetColumnsOptions::All).withExtendedObjects().withVirtuals();
-        if (storage_snapshot_->storage.supportsSubcolumns())
-            get_column_options.withSubcolumns();
+        auto get_column_options = GetColumnsOptions(GetColumnsOptions::All)
+            .withExtendedObjects()
+            .withSubcolumns(storage_snapshot_->storage.supportsSubcolumns());
 
         std::unordered_map<std::string, QueryTreeNodePtr> column_name_to_node;
 
+        /// Consider only non-virtual columns of storage while checking for _table and _database columns.
+        /// I.e. always override virtual columns with these names from underlying table (if any).
         if (!storage_snapshot_->tryGetColumn(get_column_options, "_table"))
         {
             auto table_name_node = std::make_shared<ConstantNode>(current_storage_id.table_name);
-            table_name_node->setAlias("_table");
-            column_name_to_node.emplace("_table", table_name_node);
+            auto table_name_alias = std::make_shared<ConstantNode>("__table1._table");
+
+            auto function_node = std::make_shared<FunctionNode>("__actionName");
+            function_node->getArguments().getNodes().push_back(std::move(table_name_node));
+            function_node->getArguments().getNodes().push_back(std::move(table_name_alias));
+            function_node->resolveAsFunction(FunctionFactory::instance().get("__actionName", context));
+
+            column_name_to_node.emplace("_table", function_node);
         }
 
         if (!storage_snapshot_->tryGetColumn(get_column_options, "_database"))
         {
             auto database_name_node = std::make_shared<ConstantNode>(current_storage_id.database_name);
-            database_name_node->setAlias("_database");
-            column_name_to_node.emplace("_database", database_name_node);
+            auto database_name_alias = std::make_shared<ConstantNode>("__table1._database");
+
+            auto function_node = std::make_shared<FunctionNode>("__actionName");
+            function_node->getArguments().getNodes().push_back(std::move(database_name_node));
+            function_node->getArguments().getNodes().push_back(std::move(database_name_alias));
+            function_node->resolveAsFunction(FunctionFactory::instance().get("__actionName", context));
+
+            column_name_to_node.emplace("_database", function_node);
         }
 
+        get_column_options.withVirtuals();
         auto storage_columns = storage_snapshot_->metadata->getColumns();
 
         bool with_aliases = /* common_processed_stage == QueryProcessingStage::FetchColumns && */ !storage_columns.getAliases().empty();
@@ -912,9 +1045,8 @@ SelectQueryInfo ReadFromMerge::getModifiedQueryInfo(const ContextPtr & modified_
                     column_node = std::make_shared<ColumnNode>(NameAndTypePair{column, storage_columns.getColumn(get_column_options, column).type }, modified_query_info.table_expression);
                 }
 
-
                 PlannerActionsVisitor actions_visitor(modified_query_info.planner_context, false /*use_column_identifier_as_action_node_name*/);
-                actions_visitor.visit(filter_actions_dag, column_node);
+                actions_visitor.visit(*filter_actions_dag, column_node);
             }
             column_names_as_aliases = filter_actions_dag->getRequiredColumnsNames();
             if (column_names_as_aliases.empty())
@@ -969,31 +1101,100 @@ bool recursivelyApplyToReadingSteps(QueryPlan::Node * node, const std::function<
     return ok;
 }
 
-QueryPipelineBuilderPtr ReadFromMerge::createSources(
-    QueryPlan & plan,
-    const StorageSnapshotPtr & storage_snapshot_,
+void ReadFromMerge::addVirtualColumns(
+    ChildPlan & child,
     SelectQueryInfo & modified_query_info,
     QueryProcessingStage::Enum processed_stage,
-    const Block & header,
-    const Aliases & aliases,
-    const RowPolicyDataOpt & row_policy_data_opt,
-    const StorageWithLockAndName & storage_with_lock,
-    bool concat_streams) const
+    const StorageWithLockAndName & storage_with_lock) const
 {
-    if (!plan.isInitialized())
-        return std::make_unique<QueryPipelineBuilder>();
+    const auto & [database_name, _, storage, table_name] = storage_with_lock;
 
-    QueryPipelineBuilderPtr builder;
+    /// Add virtual columns if we don't already have them.
 
-    const auto & [database_name, storage, _, table_name] = storage_with_lock;
-    bool allow_experimental_analyzer = context->getSettingsRef().allow_experimental_analyzer;
-    auto storage_stage
-        = storage->getQueryProcessingStage(context, QueryProcessingStage::Complete, storage_snapshot_, modified_query_info);
+    Block plan_header = child.plan.getCurrentHeader();
 
-    builder = plan.buildQueryPipeline(
-        QueryPlanOptimizationSettings::fromContext(context), BuildQueryPipelineSettings::fromContext(context));
+    if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
+    {
+        String table_alias = modified_query_info.query_tree->as<QueryNode>()->getJoinTree()->as<TableNode>()->getAlias();
 
-    if (processed_stage > storage_stage || (allow_experimental_analyzer && processed_stage != QueryProcessingStage::FetchColumns))
+        String database_column = table_alias.empty() || processed_stage == QueryProcessingStage::FetchColumns ? "_database" : table_alias + "._database";
+        String table_column = table_alias.empty() || processed_stage == QueryProcessingStage::FetchColumns ? "_table" : table_alias + "._table";
+
+        if (has_database_virtual_column && common_header.has(database_column)
+            && child.stage == QueryProcessingStage::FetchColumns && !plan_header.has(database_column))
+        {
+            ColumnWithTypeAndName column;
+            column.name = database_column;
+            column.type = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+            column.column = column.type->createColumnConst(0, Field(database_name));
+
+            auto adding_column_dag = ActionsDAG::makeAddingColumnActions(std::move(column));
+            auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(adding_column_dag));
+            child.plan.addStep(std::move(expression_step));
+            plan_header = child.plan.getCurrentHeader();
+        }
+
+        if (has_table_virtual_column && common_header.has(table_column)
+            && child.stage == QueryProcessingStage::FetchColumns && !plan_header.has(table_column))
+        {
+            ColumnWithTypeAndName column;
+            column.name = table_column;
+            column.type = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+            column.column = column.type->createColumnConst(0, Field(table_name));
+
+            auto adding_column_dag = ActionsDAG::makeAddingColumnActions(std::move(column));
+            auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(adding_column_dag));
+            child.plan.addStep(std::move(expression_step));
+            plan_header = child.plan.getCurrentHeader();
+        }
+    }
+    else
+    {
+        if (has_database_virtual_column && common_header.has("_database") && !plan_header.has("_database"))
+        {
+            ColumnWithTypeAndName column;
+            column.name = "_database";
+            column.type = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+            column.column = column.type->createColumnConst(0, Field(database_name));
+
+            auto adding_column_dag = ActionsDAG::makeAddingColumnActions(std::move(column));
+            auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(adding_column_dag));
+            child.plan.addStep(std::move(expression_step));
+            plan_header = child.plan.getCurrentHeader();
+        }
+
+        if (has_table_virtual_column && common_header.has("_table") && !plan_header.has("_table"))
+        {
+            ColumnWithTypeAndName column;
+            column.name = "_table";
+            column.type = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+            column.column = column.type->createColumnConst(0, Field(table_name));
+
+            auto adding_column_dag = ActionsDAG::makeAddingColumnActions(std::move(column));
+            auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(adding_column_dag));
+            child.plan.addStep(std::move(expression_step));
+            plan_header = child.plan.getCurrentHeader();
+        }
+    }
+}
+
+QueryPipelineBuilderPtr ReadFromMerge::buildPipeline(
+    ChildPlan & child,
+    QueryProcessingStage::Enum processed_stage) const
+{
+    if (!child.plan.isInitialized())
+        return nullptr;
+
+    QueryPlanOptimizationSettings optimization_settings(context);
+    /// All optimisations will be done at plans creation
+    optimization_settings.optimize_plan = false;
+    auto builder = child.plan.buildQueryPipeline(optimization_settings, BuildQueryPipelineSettings(context));
+
+    if (!builder->initialized())
+        return builder;
+
+    if (processed_stage > child.stage
+        || (context->getSettingsRef()[Setting::allow_experimental_analyzer] && processed_stage != QueryProcessingStage::FetchColumns))
     {
         /** Materialization is needed, since from distributed storage the constants come materialized.
           * If you do not do this, different types (Const and non-Const) columns will be produced in different threads,
@@ -1002,65 +1203,16 @@ QueryPipelineBuilderPtr ReadFromMerge::createSources(
         builder->addSimpleTransform([](const Block & stream_header) { return std::make_shared<MaterializingTransform>(stream_header); });
     }
 
-    if (builder->initialized())
-    {
-        if (concat_streams && builder->getNumStreams() > 1)
-        {
-            // It's possible to have many tables read from merge, resize(1) might open too many files at the same time.
-            // Using concat instead.
-            builder->addTransform(std::make_shared<ConcatProcessor>(builder->getHeader(), builder->getNumStreams()));
-        }
-
-        /// Add virtual columns if we don't already have them.
-
-        Block pipe_header = builder->getHeader();
-
-        if (has_database_virtual_column && !pipe_header.has("_database"))
-        {
-            ColumnWithTypeAndName column;
-            column.name = "_database";
-            column.type = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
-            column.column = column.type->createColumnConst(0, Field(database_name));
-
-            auto adding_column_dag = ActionsDAG::makeAddingColumnActions(std::move(column));
-            auto adding_column_actions = std::make_shared<ExpressionActions>(
-                std::move(adding_column_dag), ExpressionActionsSettings::fromContext(context, CompileExpressions::yes));
-
-            builder->addSimpleTransform([&](const Block & stream_header)
-                                        { return std::make_shared<ExpressionTransform>(stream_header, adding_column_actions); });
-        }
-
-        if (has_table_virtual_column && !pipe_header.has("_table"))
-        {
-            ColumnWithTypeAndName column;
-            column.name = "_table";
-            column.type = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
-            column.column = column.type->createColumnConst(0, Field(table_name));
-
-            auto adding_column_dag = ActionsDAG::makeAddingColumnActions(std::move(column));
-            auto adding_column_actions = std::make_shared<ExpressionActions>(
-                std::move(adding_column_dag), ExpressionActionsSettings::fromContext(context, CompileExpressions::yes));
-
-            builder->addSimpleTransform([&](const Block & stream_header)
-                                        { return std::make_shared<ExpressionTransform>(stream_header, adding_column_actions); });
-        }
-
-        /// Subordinary tables could have different but convertible types, like numeric types of different width.
-        /// We must return streams with structure equals to structure of Merge table.
-        convertAndFilterSourceStream(
-            header, modified_query_info, storage_snapshot_, aliases, row_policy_data_opt, context, *builder, processed_stage);
-    }
-
     return builder;
 }
 
-QueryPlan ReadFromMerge::createPlanForTable(
+ReadFromMerge::ChildPlan ReadFromMerge::createPlanForTable(
     const StorageSnapshotPtr & storage_snapshot_,
     SelectQueryInfo & modified_query_info,
     QueryProcessingStage::Enum processed_stage,
     UInt64 max_block_size,
     const StorageWithLockAndName & storage_with_lock,
-    Names && real_column_names,
+    const Names & real_column_names_read_from_the_source_table,
     const RowPolicyDataOpt & row_policy_data_opt,
     ContextMutablePtr modified_context,
     size_t streams_num) const
@@ -1069,57 +1221,37 @@ QueryPlan ReadFromMerge::createPlanForTable(
 
     auto & modified_select = modified_query_info.query->as<ASTSelectQuery &>();
 
-    if (!InterpreterSelectQuery::isQueryWithFinal(modified_query_info) && storage->needRewriteQueryWithFinal(real_column_names))
+    if (!InterpreterSelectQuery::isQueryWithFinal(modified_query_info) && storage->needRewriteQueryWithFinal(real_column_names_read_from_the_source_table))
     {
         /// NOTE: It may not work correctly in some cases, because query was analyzed without final.
-        /// However, it's needed for MaterializedMySQL and it's unlikely that someone will use it with Merge tables.
+        /// However, it's needed for Materialized...SQL and it's unlikely that someone will use it with Merge tables.
         modified_select.setFinal();
     }
 
-    bool allow_experimental_analyzer = modified_context->getSettingsRef().allow_experimental_analyzer;
+    bool use_analyzer = modified_context->getSettingsRef()[Setting::allow_experimental_analyzer];
 
     auto storage_stage = storage->getQueryProcessingStage(modified_context,
-        QueryProcessingStage::Complete,
+        processed_stage,
         storage_snapshot_,
         modified_query_info);
 
     QueryPlan plan;
 
-    if (processed_stage <= storage_stage || (allow_experimental_analyzer && processed_stage == QueryProcessingStage::FetchColumns))
+    if (processed_stage <= storage_stage)
     {
-        /// If there are only virtual columns in query, you must request at least one other column.
+        /// If there are only virtual columns in query, we must request at least one other column.
+        Names real_column_names = real_column_names_read_from_the_source_table;
         if (real_column_names.empty())
             real_column_names.push_back(ExpressionActions::getSmallestColumn(storage_snapshot_->metadata->getColumns().getAllPhysical()).name);
 
-        StorageView * view = dynamic_cast<StorageView *>(storage.get());
-        if (!view || allow_experimental_analyzer)
-        {
-            storage->read(plan,
-                real_column_names,
-                storage_snapshot_,
-                modified_query_info,
-                modified_context,
-                processed_stage,
-                max_block_size,
-                UInt32(streams_num));
-        }
-        else
-        {
-            /// For view storage, we need to rewrite the `modified_query_info.view_query` to optimize read.
-            /// The most intuitive way is to use InterpreterSelectQuery.
-
-            /// Intercept the settings
-            modified_context->setSetting("max_threads", streams_num);
-            modified_context->setSetting("max_streams_to_max_threads_ratio", 1);
-            modified_context->setSetting("max_block_size", max_block_size);
-
-            InterpreterSelectQuery interpreter(modified_query_info.query,
-                modified_context,
-                storage,
-                view->getInMemoryMetadataPtr(),
-                SelectQueryOptions(processed_stage));
-            interpreter.buildQueryPlan(plan);
-        }
+        storage->read(plan,
+            real_column_names,
+            storage_snapshot_,
+            modified_query_info,
+            modified_context,
+            processed_stage,
+            max_block_size,
+            UInt32(streams_num));
 
         if (!plan.isInitialized())
             return {};
@@ -1130,15 +1262,18 @@ QueryPlan ReadFromMerge::createPlanForTable(
                 row_policy_data_opt->addStorageFilter(source_step_with_filter);
         }
     }
-    else if (processed_stage > storage_stage || (allow_experimental_analyzer && processed_stage != QueryProcessingStage::FetchColumns))
+    else if (processed_stage > storage_stage || use_analyzer)
     {
         /// Maximum permissible parallelism is streams_num
         modified_context->setSetting("max_threads", streams_num);
         modified_context->setSetting("max_streams_to_max_threads_ratio", 1);
 
-        if (allow_experimental_analyzer)
+        if (use_analyzer)
         {
-            InterpreterSelectQueryAnalyzer interpreter(modified_query_info.query_tree,
+            /// Converting query to AST because types might be different in the source table.
+            /// Need to resolve types again.
+            auto ast = modified_query_info.query_tree->toAST();
+            InterpreterSelectQueryAnalyzer interpreter(ast,
                 modified_context,
                 SelectQueryOptions(processed_stage));
 
@@ -1158,7 +1293,7 @@ QueryPlan ReadFromMerge::createPlanForTable(
         }
     }
 
-    return plan;
+    return ChildPlan{std::move(plan), storage_stage};
 }
 
 ReadFromMerge::RowPolicyData::RowPolicyData(RowPolicyFilterPtr row_policy_filter_ptr,
@@ -1175,12 +1310,12 @@ ReadFromMerge::RowPolicyData::RowPolicyData(RowPolicyFilterPtr row_policy_filter
     auto expression_analyzer = ExpressionAnalyzer{expr, syntax_result, local_context};
 
     actions_dag = expression_analyzer.getActionsDAG(false /* add_aliases */, false /* project_result */);
-    filter_actions = std::make_shared<ExpressionActions>(actions_dag,
-        ExpressionActionsSettings::fromContext(local_context, CompileExpressions::yes));
+    filter_actions = std::make_shared<ExpressionActions>(actions_dag.clone(), ExpressionActionsSettings(local_context, CompileExpressions::yes));
     const auto & required_columns = filter_actions->getRequiredColumnsWithTypes();
     const auto & sample_block_columns = filter_actions->getSampleBlock().getNamesAndTypesList();
 
-    NamesAndTypesList added, deleted;
+    NamesAndTypesList added;
+    NamesAndTypesList deleted;
     sample_block_columns.getDifference(required_columns, added, deleted);
     if (!deleted.empty() || added.size() != 1)
     {
@@ -1213,15 +1348,13 @@ void ReadFromMerge::RowPolicyData::extendNames(Names & names) const
 
 void ReadFromMerge::RowPolicyData::addStorageFilter(SourceStepWithFilter * step) const
 {
-    step->addFilter(actions_dag, filter_column_name);
+    step->addFilter(actions_dag.clone(), filter_column_name);
 }
 
-void ReadFromMerge::RowPolicyData::addFilterTransform(QueryPipelineBuilder & builder) const
+void ReadFromMerge::RowPolicyData::addFilterTransform(QueryPlan & plan) const
 {
-    builder.addSimpleTransform([&](const Block & stream_header)
-    {
-        return std::make_shared<FilterTransform>(stream_header, filter_actions, filter_column_name, true /* remove filter column */);
-    });
+    auto filter_step = std::make_unique<FilterStep>(plan.getCurrentHeader(), actions_dag.clone(), filter_column_name, true /* remove filter column */);
+    plan.addStep(std::move(filter_step));
 }
 
 StorageMerge::StorageListWithLocks ReadFromMerge::getSelectedTables(
@@ -1257,7 +1390,7 @@ StorageMerge::StorageListWithLocks ReadFromMerge::getSelectedTables(
 
             if (storage.get() != storage_merge.get())
             {
-                auto table_lock = storage->lockForShare(query_context->getCurrentQueryId(), settings.lock_acquire_timeout);
+                auto table_lock = storage->lockForShare(query_context->getCurrentQueryId(), settings[Setting::lock_acquire_timeout]);
                 res.emplace_back(iterator->databaseName(), storage, std::move(table_lock), iterator->name());
                 if (filter_by_table_virtual_column)
                     table_name_virtual_column->insert(iterator->name());
@@ -1311,11 +1444,9 @@ DatabaseTablesIteratorPtr StorageMerge::DatabaseNameOrRegexp::getDatabaseIterato
         {
             if (auto it = source_databases_and_tables->find(database_name); it != source_databases_and_tables->end())
                 return it->second.contains(table_name_);
-            else
-                return false;
+            return false;
         }
-        else
-            return source_table_regexp->match(table_name_);
+        return source_table_regexp->match(table_name_);
     };
 
     return database->getTablesIterator(local_context, table_name_match);
@@ -1390,6 +1521,7 @@ void StorageMerge::alter(
     params.apply(storage_metadata, local_context);
     DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(local_context, table_id, storage_metadata);
     setInMemoryMetadata(storage_metadata);
+    setVirtuals(createVirtuals());
 }
 
 void ReadFromMerge::convertAndFilterSourceStream(
@@ -1399,21 +1531,19 @@ void ReadFromMerge::convertAndFilterSourceStream(
     const Aliases & aliases,
     const RowPolicyDataOpt & row_policy_data_opt,
     ContextPtr local_context,
-    QueryPipelineBuilder & builder,
-    QueryProcessingStage::Enum processed_stage)
+    ChildPlan & child)
 {
-    Block before_block_header = builder.getHeader();
+    Block before_block_header = child.plan.getCurrentHeader();
 
-    auto storage_sample_block = snapshot->metadata->getSampleBlock();
-    auto pipe_columns = builder.getHeader().getNamesAndTypesList();
+    auto pipe_columns = before_block_header.getNamesAndTypesList();
 
-    if (local_context->getSettingsRef().allow_experimental_analyzer)
+    if (local_context->getSettingsRef()[Setting::allow_experimental_analyzer])
     {
         for (const auto & alias : aliases)
         {
             pipe_columns.emplace_back(NameAndTypePair(alias.name, alias.type));
 
-            auto actions_dag = std::make_shared<ActionsDAG>(pipe_columns);
+            ActionsDAG actions_dag(pipe_columns);
 
             QueryTreeNodePtr query_tree = buildQueryTree(alias.expression, local_context);
             query_tree->setAlias(alias.name);
@@ -1427,14 +1557,9 @@ void ReadFromMerge::convertAndFilterSourceStream(
             if (nodes.size() != 1)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected to have 1 output but got {}", nodes.size());
 
-            actions_dag->addOrReplaceInOutputs(actions_dag->addAlias(*nodes.front(), alias.name));
-
-            auto actions = std::make_shared<ExpressionActions>(actions_dag, ExpressionActionsSettings::fromContext(local_context, CompileExpressions::yes));
-
-            builder.addSimpleTransform([&](const Block & stream_header)
-            {
-                return std::make_shared<ExpressionTransform>(stream_header, actions);
-            });
+            actions_dag.addOrReplaceInOutputs(actions_dag.addAlias(*nodes.front(), alias.name));
+            auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(actions_dag));
+            child.plan.addStep(std::move(expression_step));
         }
     }
     else
@@ -1448,37 +1573,67 @@ void ReadFromMerge::convertAndFilterSourceStream(
 
             auto dag = std::make_shared<ActionsDAG>(pipe_columns);
             auto actions_dag = expression_analyzer.getActionsDAG(true, false);
-            auto actions = std::make_shared<ExpressionActions>(actions_dag, ExpressionActionsSettings::fromContext(local_context, CompileExpressions::yes));
-
-            builder.addSimpleTransform([&](const Block & stream_header)
-            {
-                return std::make_shared<ExpressionTransform>(stream_header, actions);
-            });
+            auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(actions_dag));
+            child.plan.addStep(std::move(expression_step));
         }
     }
 
-    ActionsDAG::MatchColumnsMode convert_actions_match_columns_mode = ActionsDAG::MatchColumnsMode::Name;
-
-    if (local_context->getSettingsRef().allow_experimental_analyzer
-        && (processed_stage != QueryProcessingStage::FetchColumns || dynamic_cast<const StorageDistributed *>(&snapshot->storage) != nullptr))
-        convert_actions_match_columns_mode = ActionsDAG::MatchColumnsMode::Position;
-
+    /// This is the filter for the individual source table, that's why filtering has to be done before all structure adaptations.
     if (row_policy_data_opt)
+        row_policy_data_opt->addFilterTransform(child.plan);
+
+    /** Output headers may differ from what StorageMerge expects in some cases.
+      * When the child table engine produces a query plan for the stage after FetchColumns,
+      * execution names in the output header may be different.
+      * The same happens with StorageDistributed, even in the case of FetchColumns.
+      */
+
+    /** Convert types of columns according to the resulting Merge table.
+      * And convert column names to the expected ones.
+       */
+    ColumnsWithTypeAndName current_step_columns = child.plan.getCurrentHeader().getColumnsWithTypeAndName();
+    ColumnsWithTypeAndName converted_columns;
+    size_t size = current_step_columns.size();
+    converted_columns.reserve(current_step_columns.size());
+    for (size_t i = 0; i < size; ++i)
     {
-        row_policy_data_opt->addFilterTransform(builder);
+        const auto & source_elem = current_step_columns[i];
+        if (header.has(source_elem.name))
+        {
+            converted_columns.push_back(header.getByName(source_elem.name));
+        }
+        else if (header.columns() == current_step_columns.size())
+        {
+            /// Virtual columns and columns read from Distributed tables (having different name but matched by position).
+            converted_columns.push_back(header.getByPosition(i));
+        }
+        else
+        {
+            /// Matching by name, but some columns are unneeded.
+            converted_columns.push_back(source_elem);
+        }
     }
 
-    auto convert_actions_dag = ActionsDAG::makeConvertingActions(builder.getHeader().getColumnsWithTypeAndName(),
-                                                                header.getColumnsWithTypeAndName(),
-                                                                convert_actions_match_columns_mode);
-    auto actions = std::make_shared<ExpressionActions>(
-        std::move(convert_actions_dag),
-        ExpressionActionsSettings::fromContext(local_context, CompileExpressions::yes));
+    auto convert_actions_dag = ActionsDAG::makeConvertingActions(
+        current_step_columns,
+        converted_columns,
+        ActionsDAG::MatchColumnsMode::Position);
 
-    builder.addSimpleTransform([&](const Block & stream_header)
+    auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(convert_actions_dag));
+    child.plan.addStep(std::move(expression_step));
+
+    /// Add missing columns for the resulting Merge table.
     {
-        return std::make_shared<ExpressionTransform>(stream_header, actions);
-    });
+        auto adding_missing_defaults_dag = addMissingDefaults(
+            child.plan.getCurrentHeader(),
+            header.getNamesAndTypesList(),
+            snapshot->getAllColumnsDescription(),
+            local_context,
+            false);
+
+        auto adding_missing_defaults_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(adding_missing_defaults_dag));
+        child.plan.addStep(std::move(adding_missing_defaults_step));
+    }
 }
 
 const ReadFromMerge::StorageListWithLocks & ReadFromMerge::getSelectedTables()
@@ -1499,7 +1654,7 @@ bool ReadFromMerge::requestReadingInOrder(InputOrderInfoPtr order_info_)
     auto request_read_in_order = [order_info_](ReadFromMergeTree & read_from_merge_tree)
     {
         return read_from_merge_tree.requestReadingInOrder(
-            order_info_->used_prefix_of_sorting_key_size, order_info_->direction, order_info_->limit);
+            order_info_->used_prefix_of_sorting_key_size, order_info_->direction, order_info_->limit, {});
     };
 
     bool ok = true;
@@ -1515,29 +1670,14 @@ bool ReadFromMerge::requestReadingInOrder(InputOrderInfoPtr order_info_)
     return true;
 }
 
-void ReadFromMerge::applyFilters(const QueryPlan & plan, const ActionDAGNodes & added_filter_nodes) const
-{
-    auto apply_filters = [&added_filter_nodes](ReadFromMergeTree & read_from_merge_tree)
-    {
-        for (const auto & node : added_filter_nodes.nodes)
-            read_from_merge_tree.addFilterFromParentStep(node);
-
-        read_from_merge_tree.SourceStepWithFilter::applyFilters();
-        return true;
-    };
-
-    recursivelyApplyToReadingSteps(plan.getRootNode(), apply_filters);
-}
-
 void ReadFromMerge::applyFilters(ActionDAGNodes added_filter_nodes)
 {
-    filter_actions_dag = ActionsDAG::buildFilterActionsDAG(added_filter_nodes.nodes);
+    for (const auto & filter_info : pushed_down_filters)
+        added_filter_nodes.nodes.push_back(&filter_info.actions.findInOutputs(filter_info.column_name));
+
+    SourceStepWithFilter::applyFilters(added_filter_nodes);
 
     filterTablesAndCreateChildrenPlans();
-
-    for (const auto & child_plan : *child_plans)
-        if (child_plan.plan.isInitialized())
-            applyFilters(child_plan.plan, added_filter_nodes);
 }
 
 QueryPlanRawPtrs ReadFromMerge::getChildPlans()
@@ -1584,9 +1724,11 @@ std::tuple<bool /* is_regexp */, ASTPtr> StorageMerge::evaluateDatabaseName(cons
     return {false, ast};
 }
 
-bool StorageMerge::supportsTrivialCountOptimization() const
+bool StorageMerge::supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr ctx) const
 {
-    return getFirstTable([&](const auto & table) { return !table->supportsTrivialCountOptimization(); }) == nullptr;
+    /// Here we actually need storage snapshot of all nested tables.
+    /// But to avoid complexity pass nullptr to make more lightweight check in MergeTreeData.
+    return getFirstTable([&](const auto & table) { return !table->supportsTrivialCountOptimization(nullptr, ctx); }) == nullptr;
 }
 
 std::optional<UInt64> StorageMerge::totalRows(const Settings & settings) const
@@ -1647,22 +1789,6 @@ void registerStorageMerge(StorageFactory & factory)
     {
         .supports_schema_inference = true
     });
-}
-
-NamesAndTypesList StorageMerge::getVirtuals() const
-{
-    NamesAndTypesList virtuals{
-        {"_database", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>())},
-        {"_table", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>())}};
-
-    auto first_table = getFirstTable([](auto && table) { return table; });
-    if (first_table)
-    {
-        auto table_virtuals = first_table->getVirtuals();
-        virtuals.insert(virtuals.end(), table_virtuals.begin(), table_virtuals.end());
-    }
-
-    return virtuals;
 }
 
 }

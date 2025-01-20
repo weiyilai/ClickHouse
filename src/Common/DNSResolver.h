@@ -34,6 +34,9 @@ public:
     Poco::Net::IPAddress resolveHost(const std::string & host);
 
     /// Accepts host names like 'example.com' or '127.0.0.1' or '::1' and resolves all its IPs
+    /// resolveHostAllInOriginOrder returns addresses with the same order as system call returns it
+    IPAddresses resolveHostAllInOriginOrder(const std::string & host);
+    /// resolveHostAll returns addresses in random order
     IPAddresses resolveHostAll(const std::string & host);
 
     /// Accepts host names like 'example.com:port' or '127.0.0.1:port' or '[::1]:port' and resolves its IP and port
@@ -53,7 +56,7 @@ public:
     void setDisableCacheFlag(bool is_disabled = true);
 
     /// Set a limit of entries in cache
-    void setCacheMaxEntries(const UInt64 cache_max_entries);
+    void setCacheMaxEntries(UInt64 cache_max_entries);
 
     /// Drops all caches
     void dropCache();
@@ -64,6 +67,8 @@ public:
     /// Updates all known hosts in cache.
     /// Returns true if IP of any host has been changed or an element was dropped (too many failures)
     bool updateCache(UInt32 max_consecutive_failures);
+
+    void setFilterSettings(bool dns_allow_resolve_names_to_ipv4, bool dns_allow_resolve_names_to_ipv6);
 
     /// Returns a copy of cache entries
     std::vector<std::pair<std::string, CacheEntry>> cacheEntries() const;
@@ -83,6 +88,10 @@ private:
 
     struct Impl;
     std::unique_ptr<Impl> impl;
+
+    struct AddressFilter;
+    std::unique_ptr<AddressFilter> addressFilter;
+
     LoggerPtr log;
 
     /// Updates cached value and returns true it has been changed.
@@ -91,6 +100,9 @@ private:
 
     void addToNewHosts(const String & host);
     void addToNewAddresses(const Poco::Net::IPAddress & address);
+
+    IPAddresses resolveIPAddressWithCache(const std::string & host);
+    IPAddresses getResolvedIPAdressessWithFiltering(const std::string & host);
 };
 
 }

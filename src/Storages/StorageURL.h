@@ -48,9 +48,6 @@ public:
 
     bool supportsPartitionBy() const override { return true; }
 
-    NamesAndTypesList getVirtuals() const override;
-    static Names getVirtualColumnNames();
-
     static ColumnsDescription getTableStructureFromData(
         const String & format,
         const String & uri,
@@ -106,8 +103,6 @@ protected:
     ASTPtr partition_by;
     bool distributed_processing;
 
-    NamesAndTypesList virtual_columns;
-
     virtual std::string getReadMethod() const;
 
     virtual std::vector<std::pair<std::string, std::string>> getReadURIParams(
@@ -132,7 +127,7 @@ protected:
 
     bool parallelizeOutputAfterReading(ContextPtr context) const override;
 
-    bool supportsTrivialCountOptimization() const override { return true; }
+    bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override { return true; }
 
 private:
     static std::pair<ColumnsDescription, String> getTableStructureAndFormatFromDataImpl(
@@ -146,6 +141,9 @@ private:
     virtual Block getHeaderBlock(const Names & column_names, const StorageSnapshotPtr & storage_snapshot) const = 0;
 };
 
+bool urlWithGlobs(const String & uri);
+
+String getSampleURI(String uri, ContextPtr context);
 
 class StorageURLSource : public SourceWithKeyCondition, WithContext
 {
@@ -186,9 +184,11 @@ public:
         bool glob_url = false,
         bool need_only_count_ = false);
 
+    ~StorageURLSource() override;
+
     String getName() const override { return name; }
 
-    void setKeyCondition(const ActionsDAGPtr & filter_actions_dag, ContextPtr context_) override
+    void setKeyCondition(const std::optional<ActionsDAG> & filter_actions_dag, ContextPtr context_) override
     {
         setKeyConditionImpl(filter_actions_dag, context_, block_for_format);
     }
@@ -220,6 +220,7 @@ private:
     String name;
     ColumnsDescription columns_description;
     NamesAndTypesList requested_columns;
+    bool need_headers_virtual_column;
     NamesAndTypesList requested_virtual_columns;
     Block block_for_format;
     std::shared_ptr<IteratorWrapper> uri_iterator;
@@ -231,12 +232,15 @@ private:
     bool need_only_count;
     size_t total_rows_in_file = 0;
 
+    Poco::Net::HTTPBasicCredentials credentials;
+
+    Map http_response_headers;
+    bool http_response_headers_initialized = false;
+
     std::unique_ptr<ReadBuffer> read_buf;
     std::shared_ptr<IInputFormat> input_format;
     std::unique_ptr<QueryPipeline> pipeline;
     std::unique_ptr<PullingPipelineExecutor> reader;
-
-    Poco::Net::HTTPBasicCredentials credentials;
 };
 
 class StorageURLSink : public SinkToStorage
@@ -253,19 +257,19 @@ public:
         const HTTPHeaderEntries & headers = {},
         const String & method = Poco::Net::HTTPRequest::HTTP_POST);
 
+    ~StorageURLSink() override;
+
     std::string getName() const override { return "StorageURLSink"; }
-    void consume(Chunk chunk) override;
-    void onCancel() override;
-    void onException(std::exception_ptr exception) override;
+    void consume(Chunk & chunk) override;
     void onFinish() override;
 
 private:
-    void finalize();
-    void release();
+    void finalizeBuffers();
+    void releaseBuffers();
+    void cancelBuffers();
+
     std::unique_ptr<WriteBuffer> write_buf;
     OutputFormatPtr writer;
-    std::mutex cancel_mutex;
-    bool cancelled = false;
 };
 
 class StorageURL : public IStorageURLBase
@@ -297,6 +301,11 @@ public:
     }
 
     bool supportsSubcolumns() const override { return true; }
+    bool supportsOptimizationToSubcolumns() const override { return false; }
+
+    bool supportsDynamicSubcolumns() const override { return true; }
+
+    void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
     static FormatSettings getFormatSettingsFromArgs(const StorageFactory::Arguments & args);
 
@@ -313,7 +322,7 @@ public:
     /// Does evaluateConstantExpressionOrIdentifierAsLiteral() on all arguments.
     /// If `headers(...)` argument is present, parses it and moves it to the end of the array.
     /// Returns number of arguments excluding `headers(...)`.
-    static size_t evalArgsAndCollectHeaders(ASTs & url_function_args, HTTPHeaderEntries & header_entries, const ContextPtr & context);
+    static size_t evalArgsAndCollectHeaders(ASTs & url_function_args, HTTPHeaderEntries & header_entries, const ContextPtr & context, bool evaluate_arguments = true);
 
     static void processNamedCollectionResult(Configuration & configuration, const NamedCollection & collection);
 };

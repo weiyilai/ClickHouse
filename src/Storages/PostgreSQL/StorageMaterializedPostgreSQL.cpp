@@ -1,4 +1,5 @@
-#include "StorageMaterializedPostgreSQL.h"
+#include <Storages/PostgreSQL/StorageMaterializedPostgreSQL.h>
+#include <Storages/PostgreSQL/MaterializedPostgreSQLSettings.h>
 
 #if USE_LIBPQXX
 #include <Common/logger_useful.h>
@@ -10,7 +11,6 @@
 #include <Core/Settings.h>
 #include <Core/PostgreSQL/Connection.h>
 
-#include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypesDecimal.h>
@@ -21,8 +21,8 @@
 
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/ReadFromPreparedSource.h>
-#include <Processors/Transforms/FilterTransform.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTDataType.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/ExpressionListParsers.h>
@@ -40,6 +40,17 @@
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool allow_experimental_materialized_postgresql_table;
+    extern const SettingsSeconds lock_acquire_timeout;
+    extern const SettingsUInt64 postgresql_connection_attempt_timeout;
+}
+
+namespace MaterializedPostgreSQLSetting
+{
+    extern const MaterializedPostgreSQLSettingsString materialized_postgresql_tables_list;
+}
 
 namespace ErrorCodes
 {
@@ -72,8 +83,9 @@ StorageMaterializedPostgreSQL::StorageMaterializedPostgreSQL(
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage MaterializedPostgreSQL is allowed only for Atomic database");
 
     setInMemoryMetadata(storage_metadata);
+    setVirtuals(createVirtuals());
 
-    replication_settings->materialized_postgresql_tables_list = remote_table_name_;
+    (*replication_settings)[MaterializedPostgreSQLSetting::materialized_postgresql_tables_list] = remote_table_name_;
 
     replication_handler = std::make_unique<PostgreSQLReplicationHandler>(
             remote_database_name,
@@ -127,8 +139,16 @@ StorageMaterializedPostgreSQL::StorageMaterializedPostgreSQL(
     , nested_table_id(nested_storage_->getStorageID())
 {
     setInMemoryMetadata(nested_storage_->getInMemoryMetadata());
+    setVirtuals(*nested_storage_->getVirtualsPtr());
 }
 
+VirtualColumnsDescription StorageMaterializedPostgreSQL::createVirtuals()
+{
+    VirtualColumnsDescription desc;
+    desc.addEphemeral("_sign", std::make_shared<DataTypeInt8>(), "");
+    desc.addEphemeral("_version", std::make_shared<DataTypeUInt64>(), "");
+    return desc;
+}
 
 /// A temporary clone table might be created for current table in order to update its schema and reload
 /// all data in the background while current table will still handle read requests.
@@ -254,15 +274,6 @@ void StorageMaterializedPostgreSQL::dropInnerTableIfAny(bool sync, ContextPtr lo
 }
 
 
-NamesAndTypesList StorageMaterializedPostgreSQL::getVirtuals() const
-{
-    return NamesAndTypesList{
-            {"_sign", std::make_shared<DataTypeInt8>()},
-            {"_version", std::make_shared<DataTypeUInt64>()}
-    };
-}
-
-
 bool StorageMaterializedPostgreSQL::needRewriteQueryWithFinal(const Names & column_names) const
 {
     return needRewriteQueryWithFinalForStorage(column_names, getNested());
@@ -284,7 +295,7 @@ void StorageMaterializedPostgreSQL::read(
     readFinalFromNestedStorage(query_plan, nested_table, column_names,
             query_info, context_, processed_stage, max_block_size, num_streams);
 
-    auto lock = lockForShare(context_->getCurrentQueryId(), context_->getSettingsRef().lock_acquire_timeout);
+    auto lock = lockForShare(context_->getCurrentQueryId(), context_->getSettingsRef()[Setting::lock_acquire_timeout]);
     query_plan.addTableLock(lock);
     query_plan.addStorageHolder(shared_from_this());
 }
@@ -296,7 +307,7 @@ std::shared_ptr<ASTColumnDeclaration> StorageMaterializedPostgreSQL::getMaterial
     auto column_declaration = std::make_shared<ASTColumnDeclaration>();
 
     column_declaration->name = std::move(name);
-    column_declaration->type = makeASTFunction(type);
+    column_declaration->type = makeASTDataType(type);
 
     column_declaration->default_specifier = "MATERIALIZED";
     column_declaration->default_expression = std::make_shared<ASTLiteral>(default_value);
@@ -313,17 +324,17 @@ ASTPtr StorageMaterializedPostgreSQL::getColumnDeclaration(const DataTypePtr & d
     WhichDataType which(data_type);
 
     if (which.isNullable())
-        return makeASTFunction("Nullable", getColumnDeclaration(typeid_cast<const DataTypeNullable *>(data_type.get())->getNestedType()));
+        return makeASTDataType("Nullable", getColumnDeclaration(typeid_cast<const DataTypeNullable *>(data_type.get())->getNestedType()));
 
     if (which.isArray())
-        return makeASTFunction("Array", getColumnDeclaration(typeid_cast<const DataTypeArray *>(data_type.get())->getNestedType()));
+        return makeASTDataType("Array", getColumnDeclaration(typeid_cast<const DataTypeArray *>(data_type.get())->getNestedType()));
 
     /// getName() for decimal returns 'Decimal(precision, scale)', will get an error with it
     if (which.isDecimal())
     {
         auto make_decimal_expression = [&](std::string type_name)
         {
-            auto ast_expression = std::make_shared<ASTFunction>();
+            auto ast_expression = std::make_shared<ASTDataType>();
 
             ast_expression->name = type_name;
             ast_expression->arguments = std::make_shared<ASTExpressionList>();
@@ -347,7 +358,7 @@ ASTPtr StorageMaterializedPostgreSQL::getColumnDeclaration(const DataTypePtr & d
 
     if (which.isDateTime64())
     {
-        auto ast_expression = std::make_shared<ASTFunction>();
+        auto ast_expression = std::make_shared<ASTDataType>();
 
         ast_expression->name = "DateTime64";
         ast_expression->arguments = std::make_shared<ASTExpressionList>();
@@ -355,7 +366,7 @@ ASTPtr StorageMaterializedPostgreSQL::getColumnDeclaration(const DataTypePtr & d
         return ast_expression;
     }
 
-    return std::make_shared<ASTIdentifier>(data_type->getName());
+    return makeASTDataType(data_type->getName());
 }
 
 
@@ -479,7 +490,7 @@ ASTPtr StorageMaterializedPostgreSQL::getCreateNestedTableQuery(
                     ASTPtr result;
 
                     Tokens tokens(attr.attr_def.data(), attr.attr_def.data() + attr.attr_def.size());
-                    IParser::Pos pos(tokens, DBMS_DEFAULT_MAX_PARSER_DEPTH);
+                    IParser::Pos pos(tokens, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
                     if (!expr_parser.parse(pos, result, expected))
                     {
                         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failed to parse default expression: {}", attr.attr_def);
@@ -572,9 +583,10 @@ void registerStorageMaterializedPostgreSQL(StorageFactory & factory)
         StorageInMemoryMetadata metadata;
         metadata.setColumns(args.columns);
         metadata.setConstraints(args.constraints);
+        metadata.setComment(args.comment);
 
         if (args.mode <= LoadingStrictnessLevel::CREATE
-            && !args.getLocalContext()->getSettingsRef().allow_experimental_materialized_postgresql_table)
+            && !args.getLocalContext()->getSettingsRef()[Setting::allow_experimental_materialized_postgresql_table])
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "MaterializedPostgreSQL is an experimental table engine."
                                 " You can enable it with the `allow_experimental_materialized_postgresql_table` setting");
 
@@ -591,8 +603,12 @@ void registerStorageMaterializedPostgreSQL(StorageFactory & factory)
 
         auto configuration = StoragePostgreSQL::getConfiguration(args.engine_args, args.getContext());
         auto connection_info = postgres::formatConnectionString(
-            configuration.database, configuration.host, configuration.port,
-            configuration.username, configuration.password);
+            configuration.database,
+            configuration.host,
+            configuration.port,
+            configuration.username,
+            configuration.password,
+            args.getContext()->getSettingsRef()[Setting::postgresql_connection_attempt_timeout]);
 
         bool has_settings = args.storage_def->settings;
         auto postgresql_replication_settings = std::make_unique<MaterializedPostgreSQLSettings>();
@@ -607,13 +623,14 @@ void registerStorageMaterializedPostgreSQL(StorageFactory & factory)
     };
 
     factory.registerStorage(
-            "MaterializedPostgreSQL",
-            creator_fn,
-            StorageFactory::StorageFeatures{
-                .supports_settings = true,
-                .supports_sort_order = true,
-                .source_access_type = AccessType::POSTGRES,
-    });
+        "MaterializedPostgreSQL",
+        creator_fn,
+        StorageFactory::StorageFeatures{
+            .supports_settings = true,
+            .supports_sort_order = true,
+            .source_access_type = AccessType::POSTGRES,
+            .has_builtin_setting_fn = MaterializedPostgreSQLSettings::hasBuiltin,
+        });
 }
 
 }

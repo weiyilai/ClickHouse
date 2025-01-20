@@ -33,20 +33,20 @@ namespace ErrorCodes
     extern const int SYNTAX_ERROR;
 }
 
-bool ParserKQLBase::parseByString(const String expr, ASTPtr & node, const uint32_t max_depth)
+bool ParserKQLBase::parseByString(String expr, ASTPtr & node, uint32_t max_depth, uint32_t max_backtracks)
 {
     Expected expected;
 
-    Tokens tokens(expr.c_str(), expr.c_str() + expr.size());
-    IParser::Pos pos(tokens, max_depth);
+    Tokens tokens(expr.data(), expr.data() + expr.size(), 0, true);
+    IParser::Pos pos(tokens, max_depth, max_backtracks);
     return parse(pos, node, expected);
 }
 
-bool ParserKQLBase::parseSQLQueryByString(ParserPtr && parser, String & query, ASTPtr & select_node, int32_t max_depth)
+bool ParserKQLBase::parseSQLQueryByString(ParserPtr && parser, String & query, ASTPtr & select_node, uint32_t max_depth, uint32_t max_backtracks)
 {
     Expected expected;
-    Tokens token_subquery(query.c_str(), query.c_str() + query.size());
-    IParser::Pos pos_subquery(token_subquery, max_depth);
+    Tokens token_subquery(query.data(), query.data() + query.size(), 0, true);
+    IParser::Pos pos_subquery(token_subquery, max_depth, max_backtracks);
     if (!parser->parse(pos_subquery, select_node, expected))
         return false;
     return true;
@@ -121,10 +121,10 @@ bool ParserKQLBase::setSubQuerySource(ASTPtr & select_query, ASTPtr & source, bo
     return true;
 }
 
-String ParserKQLBase::getExprFromToken(const String & text, const uint32_t max_depth)
+String ParserKQLBase::getExprFromToken(const String & text, uint32_t max_depth, uint32_t max_backtracks)
 {
-    Tokens tokens(text.c_str(), text.c_str() + text.size());
-    IParser::Pos pos(tokens, max_depth);
+    Tokens tokens(text.data(), text.data() + text.size(), 0, true);
+    IParser::Pos pos(tokens, max_depth, max_backtracks);
 
     return getExprFromToken(pos);
 }
@@ -309,28 +309,27 @@ std::unique_ptr<IParserBase> ParserKQLQuery::getOperator(String & op_name)
 {
     if (op_name == "filter" || op_name == "where")
         return std::make_unique<ParserKQLFilter>();
-    else if (op_name == "limit" || op_name == "take")
+    if (op_name == "limit" || op_name == "take")
         return std::make_unique<ParserKQLLimit>();
-    else if (op_name == "project")
+    if (op_name == "project")
         return std::make_unique<ParserKQLProject>();
-    else if (op_name == "distinct")
+    if (op_name == "distinct")
         return std::make_unique<ParserKQLDistinct>();
-    else if (op_name == "extend")
+    if (op_name == "extend")
         return std::make_unique<ParserKQLExtend>();
-    else if (op_name == "sort by" || op_name == "order by")
+    if (op_name == "sort by" || op_name == "order by")
         return std::make_unique<ParserKQLSort>();
-    else if (op_name == "summarize")
+    if (op_name == "summarize")
         return std::make_unique<ParserKQLSummarize>();
-    else if (op_name == "table")
+    if (op_name == "table")
         return std::make_unique<ParserKQLTable>();
-    else if (op_name == "make-series")
+    if (op_name == "make-series")
         return std::make_unique<ParserKQLMakeSeries>();
-    else if (op_name == "mv-expand")
+    if (op_name == "mv-expand")
         return std::make_unique<ParserKQLMVExpand>();
-    else if (op_name == "print")
+    if (op_name == "print")
         return std::make_unique<ParserKQLPrint>();
-    else
-        return nullptr;
+    return nullptr;
 }
 
 bool ParserKQLQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
@@ -399,7 +398,7 @@ bool ParserKQLQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
                     if (!isValidKQLPos(pos))
                         return false;
 
-                    ParserKeyword s_by("by");
+                    ParserKeyword s_by(Keyword::BY);
                     if (s_by.ignore(pos, expected))
                     {
                         kql_operator = "order by";
@@ -416,8 +415,9 @@ bool ParserKQLQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
                     ParserToken s_dash(TokenType::Minus);
                     if (s_dash.ignore(pos, expected))
                     {
-                        String tmp_op(op_pos_begin->begin, pos->end);
-                        kql_operator = tmp_op;
+                        if (!isValidKQLPos(pos))
+                            return false;
+                        kql_operator = String(op_pos_begin->begin, pos->end);
                     }
                     else
                         --pos;
@@ -475,7 +475,10 @@ bool ParserKQLQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     }
     else
     {
-        String project_clause, order_clause, where_clause, limit_clause;
+        String project_clause;
+        String order_clause;
+        String where_clause;
+        String limit_clause;
         auto last_pos = operation_pos.back().second;
         auto last_op = operation_pos.back().first;
 
@@ -521,8 +524,8 @@ bool ParserKQLQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
                 --last_pos;
 
             String sub_query = std::format("({})", String(operation_pos.front().second->begin, last_pos->end));
-            Tokens token_subquery(sub_query.c_str(), sub_query.c_str() + sub_query.size());
-            IParser::Pos pos_subquery(token_subquery, pos.max_depth);
+            Tokens token_subquery(sub_query.data(), sub_query.data() + sub_query.size(), 0, true);
+            IParser::Pos pos_subquery(token_subquery, pos.max_depth, pos.max_backtracks);
 
             if (!ParserKQLSubquery().parse(pos_subquery, tables, expected))
                 return false;
@@ -542,8 +545,8 @@ bool ParserKQLQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
             auto oprator = getOperator(op_str);
             if (oprator)
             {
-                Tokens token_clause(op_calsue.c_str(), op_calsue.c_str() + op_calsue.size());
-                IParser::Pos pos_clause(token_clause, pos.max_depth);
+                Tokens token_clause(op_calsue.data(), op_calsue.data() + op_calsue.size(), 0, true);
+                IParser::Pos pos_clause(token_clause, pos.max_depth, pos.max_backtracks);
                 if (!oprator->parse(pos_clause, node, expected))
                     return false;
             }
@@ -575,8 +578,8 @@ bool ParserKQLQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     if (!node->as<ASTSelectQuery>()->select())
     {
         auto expr = String("*");
-        Tokens tokens(expr.c_str(), expr.c_str() + expr.size());
-        IParser::Pos new_pos(tokens, pos.max_depth);
+        Tokens tokens(expr.data(), expr.data() + expr.size(), 0, true);
+        IParser::Pos new_pos(tokens, pos.max_depth, pos.max_backtracks);
         if (!std::make_unique<ParserKQLProject>()->parse(new_pos, node, expected))
             return false;
     }

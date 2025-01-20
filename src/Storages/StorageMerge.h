@@ -49,11 +49,16 @@ public:
     bool supportsSampling() const override { return true; }
     bool supportsFinal() const override { return true; }
     bool supportsSubcolumns() const override { return true; }
-    bool supportsPrewhere() const override { return tableSupportsPrewhere(); }
+    bool supportsDynamicSubcolumns() const override { return true; }
+    bool supportsPrewhere() const override;
     std::optional<NameSet> supportedPrewhereColumns() const override;
+
+    bool canMoveConditionsToPrewhere() const override;
 
     QueryProcessingStage::Enum
     getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
+
+    StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr) const override;
 
     void read(
         QueryPlan & query_plan,
@@ -74,13 +79,17 @@ public:
     /// Evaluate database name or regexp for StorageMerge and TableFunction merge
     static std::tuple<bool /* is_regexp */, ASTPtr> evaluateDatabaseName(const ASTPtr & node, ContextPtr context);
 
-    bool supportsTrivialCountOptimization() const override;
+    bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override;
 
     std::optional<UInt64> totalRows(const Settings & settings) const override;
     std::optional<UInt64> totalBytes(const Settings & settings) const override;
 
     using DatabaseTablesIterators = std::vector<DatabaseTablesIteratorPtr>;
     DatabaseTablesIterators getDatabaseIterators(ContextPtr context) const;
+
+    /// Returns a unified column structure among multiple tables.
+    /// Takes a function that invokes a callback for every table. NOTE: This is quite inconvenient.
+    static ColumnsDescription unifyColumnsDescription(std::function<void(std::function<void(const StoragePtr &)>)> for_each_table);
 
 private:
     /// (Database, Table, Lock, TableName)
@@ -116,10 +125,11 @@ private:
     template <typename F>
     void forEachTable(F && func) const;
 
-    NamesAndTypesList getVirtuals() const override;
     ColumnSizeByName getColumnSizes() const override;
 
-    ColumnsDescription getColumnsDescriptionFromSourceTables() const;
+    ColumnsDescription getColumnsDescriptionFromSourceTables(size_t max_tables_to_look) const;
+
+    static VirtualColumnsDescription createVirtuals();
 
     bool tableSupportsPrewhere() const;
 
@@ -156,12 +166,13 @@ public:
 
     /// Returns `false` if requested reading cannot be performed.
     bool requestReadingInOrder(InputOrderInfoPtr order_info_);
+    const InputOrderInfoPtr & getInputOrder() const { return order_info; }
 
     void applyFilters(ActionDAGNodes added_filter_nodes) override;
 
     QueryPlanRawPtrs getChildPlans() override;
 
-    void updatePrewhereInfo(const PrewhereInfoPtr & prewhere_info_value) override;
+    void addFilter(FilterDAGInfo filter);
 
 private:
     const size_t required_max_block_size;
@@ -189,7 +200,7 @@ private:
 
     using Aliases = std::vector<AliasData>;
 
-    SelectQueryInfo getModifiedQueryInfo(const ContextPtr & modified_context,
+    SelectQueryInfo getModifiedQueryInfo(const ContextMutablePtr & modified_context,
         const StorageWithLockAndName & storage_with_lock_and_name,
         const StorageSnapshotPtr & storage_snapshot,
         Names required_column_names,
@@ -217,11 +228,11 @@ private:
 
         /// Create explicit filter transform to exclude
         /// rows that are not conform to row level policy
-        void addFilterTransform(QueryPipelineBuilder &) const;
+        void addFilterTransform(QueryPlan &) const;
 
     private:
         std::string filter_column_name; // complex filter, may contain logic operations
-        ActionsDAGPtr actions_dag;
+        ActionsDAG actions_dag;
         ExpressionActionsPtr filter_actions;
         StorageMetadataPtr storage_metadata_snapshot;
     };
@@ -231,41 +242,40 @@ private:
     struct ChildPlan
     {
         QueryPlan plan;
-        Aliases table_aliases;
-        RowPolicyDataOpt row_policy_data_opt;
+        QueryProcessingStage::Enum stage;
     };
 
     /// Store read plan for each child table.
     /// It's needed to guarantee lifetime for child steps to be the same as for this step (mainly for EXPLAIN PIPELINE).
     std::optional<std::vector<ChildPlan>> child_plans;
 
+    /// Store filters pushed down from query plan optimization. Filters are added on top of child plans.
+    std::vector<FilterDAGInfo> pushed_down_filters;
+
     std::vector<ChildPlan> createChildrenPlans(SelectQueryInfo & query_info_) const;
 
     void filterTablesAndCreateChildrenPlans();
 
-    void applyFilters(const QueryPlan & plan, const ActionDAGNodes & added_filter_nodes) const;
-
-    QueryPlan createPlanForTable(
+    ChildPlan createPlanForTable(
         const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,
         QueryProcessingStage::Enum processed_stage,
         UInt64 max_block_size,
         const StorageWithLockAndName & storage_with_lock,
-        Names && real_column_names,
+        const Names & real_column_names_read_from_the_source_table,
         const RowPolicyDataOpt & row_policy_data_opt,
         ContextMutablePtr modified_context,
         size_t streams_num) const;
 
-    QueryPipelineBuilderPtr createSources(
-        QueryPlan & plan,
-        const StorageSnapshotPtr & storage_snapshot,
+    void addVirtualColumns(
+        ChildPlan & child,
         SelectQueryInfo & modified_query_info,
         QueryProcessingStage::Enum processed_stage,
-        const Block & header,
-        const Aliases & aliases,
-        const RowPolicyDataOpt & row_policy_data_opt,
-        const StorageWithLockAndName & storage_with_lock,
-        bool concat_streams = false) const;
+        const StorageWithLockAndName & storage_with_lock) const;
+
+    QueryPipelineBuilderPtr buildPipeline(
+        ChildPlan & child,
+        QueryProcessingStage::Enum processed_stage) const;
 
     static void convertAndFilterSourceStream(
         const Block & header,
@@ -274,8 +284,7 @@ private:
         const Aliases & aliases,
         const RowPolicyDataOpt & row_policy_data_opt,
         ContextPtr context,
-        QueryPipelineBuilder & builder,
-        QueryProcessingStage::Enum processed_stage);
+        ChildPlan & child);
 
     StorageMerge::StorageListWithLocks getSelectedTables(
         ContextPtr query_context,

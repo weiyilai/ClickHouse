@@ -186,9 +186,8 @@ void DWARFBlockInputFormat::initELF()
     /// If can't mmap, read the entire file into memory.
     /// We could read just the .debug_* sections, but typically they take up most of the binary anyway (60% for clickhouse debug build).
     {
-        WriteBufferFromVector buf(file_contents);
+        auto buf = WriteBufferFromVector<PODArray<char>>(file_contents);
         copyData(*in, buf, is_stopped);
-        buf.finalize();
     }
     elf.emplace(file_contents.data(), file_contents.size(), "<input>");
 }
@@ -325,11 +324,21 @@ void DWARFBlockInputFormat::skipAttribute(
     const llvm::DWARFAbbreviationDeclaration::AttributeSpec & attr, uint64_t * offset,
     const UnitState & unit) const
 {
-    if (!llvm::DWARFFormValue::skipValue(
-        attr.Form, *extractor, offset, unit.dwarf_unit->getFormParams()))
-            throw Exception(ErrorCodes::CANNOT_PARSE_DWARF,
-                "Failed to skip attribute {} of form {} at offset {}",
-                llvm::dwarf::AttributeString(attr.Attr), attr.Form, *offset);
+    if (attr.Form == llvm::dwarf::DW_FORM_strx3)
+    {
+        /// DWARFFormValue::skipValue() fails on DW_FORM_strx3 because the `switch` statement is
+        /// missing this form for some reason. Maybe it's a bug in llvm.
+        /// Use extractValue() to work around.
+        parseAttribute(attr, offset, unit);
+    }
+    else
+    {
+        if (!llvm::DWARFFormValue::skipValue(
+            attr.Form, *extractor, offset, unit.dwarf_unit->getFormParams()))
+                throw Exception(ErrorCodes::CANNOT_PARSE_DWARF,
+                    "Failed to skip attribute {} of form {} at offset {}",
+                    llvm::dwarf::AttributeString(attr.Attr), attr.Form, *offset);
+    }
 }
 
 uint64_t DWARFBlockInputFormat::parseAddress(llvm::dwarf::Attribute attr, const llvm::DWARFFormValue & val, const UnitState & unit)
@@ -828,7 +837,7 @@ void DWARFBlockInputFormat::parseRanges(
     uint64_t offset, bool form_rnglistx, const UnitState & unit, const ColumnVector<UInt64>::MutablePtr & col_ranges_start,
     const ColumnVector<UInt64>::MutablePtr & col_ranges_end) const
 {
-    llvm::Optional<llvm::object::SectionedAddress> base_addr;
+    std::optional<llvm::object::SectionedAddress> base_addr;
     if (unit.base_address != UINT64_MAX)
         base_addr = llvm::object::SectionedAddress{.Address = unit.base_address};
 
@@ -873,7 +882,7 @@ void DWARFBlockInputFormat::parseRanges(
         if (err)
             throw Exception(ErrorCodes::CANNOT_PARSE_DWARF, "Error parsing .debug_rnglists list: {}", llvm::toString(std::move(err)));
 
-        auto lookup_addr = [&](uint32_t idx) -> llvm::Optional<llvm::object::SectionedAddress>
+        auto lookup_addr = [&](uint32_t idx) -> std::optional<llvm::object::SectionedAddress>
             {
                 uint64_t addr = fetchFromDebugAddr(unit.debug_addr_base, idx);
                 return llvm::object::SectionedAddress{.Address = addr};

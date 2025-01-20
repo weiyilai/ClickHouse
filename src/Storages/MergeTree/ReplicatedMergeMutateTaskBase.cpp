@@ -1,13 +1,19 @@
 #include <Storages/MergeTree/ReplicatedMergeMutateTaskBase.h>
 
-#include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeQueue.h>
+#include <Storages/StorageReplicatedMergeTree.h>
+#include <Common/ErrorCodes.h>
 #include <Common/ProfileEventsScope.h>
 
 
 namespace DB
 {
+namespace MergeTreeSetting
+{
+    extern const MergeTreeSettingsUInt64 max_postpone_time_for_failed_mutations_ms;
+}
 
 namespace ErrorCodes
 {
@@ -117,8 +123,9 @@ bool ReplicatedMergeMutateTaskBase::executeStep()
                     status.latest_failed_part_info = source_part_info;
                     status.latest_fail_time = time(nullptr);
                     status.latest_fail_reason = getExceptionMessage(saved_exception, false);
+                    status.latest_fail_error_code_name = ErrorCodes::getName(getExceptionErrorCode(saved_exception));
                     if (result_data_version == it->first)
-                        storage.mutation_backoff_policy.addPartMutationFailure(src_part, storage.getSettings()->max_postpone_time_for_failed_mutations_ms);
+                        storage.mutation_backoff_policy.addPartMutationFailure(src_part, (*storage.getSettings())[MergeTreeSetting::max_postpone_time_for_failed_mutations_ms]);
                 }
             }
         }
@@ -164,8 +171,16 @@ bool ReplicatedMergeMutateTaskBase::executeImpl()
 
     auto execute_fetch = [&] (bool need_to_check_missing_part) -> bool
     {
-        if (storage.executeFetch(entry, need_to_check_missing_part))
-            return remove_processed_entry();
+        try
+        {
+            if (storage.executeFetch(entry, need_to_check_missing_part))
+                return remove_processed_entry();
+        }
+        catch (...)
+        {
+            part_log_writer(ExecutionStatus::fromCurrentException("", true));
+            throw;
+        }
 
         return false;
     };
@@ -205,8 +220,7 @@ bool ReplicatedMergeMutateTaskBase::executeImpl()
             }
             catch (...)
             {
-                if (part_log_writer)
-                    part_log_writer(ExecutionStatus::fromCurrentException("", true));
+                part_log_writer(ExecutionStatus::fromCurrentException("", true));
                 throw;
             }
 
@@ -214,17 +228,8 @@ bool ReplicatedMergeMutateTaskBase::executeImpl()
         }
         case State::NEED_FINALIZE :
         {
-            try
-            {
-                if (!finalize(part_log_writer))
-                    return execute_fetch(/* need_to_check_missing = */true);
-            }
-            catch (...)
-            {
-                if (part_log_writer)
-                    part_log_writer(ExecutionStatus::fromCurrentException("", true));
-                throw;
-            }
+            if (!finalize(part_log_writer))
+                return execute_fetch(/* need_to_check_missing = */true);
 
             return remove_processed_entry();
         }

@@ -8,23 +8,27 @@ ARG apt_archive="http://archive.ubuntu.com"
 RUN sed -i "s|http://archive.ubuntu.com|$apt_archive|g" /etc/apt/sources.list
 
 RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
-    aspell \
-    curl \
-    git \
-    file \
-    libxml2-utils \
-    moreutils \
-    python3-fuzzywuzzy \
-    python3-pip \
-    yamllint \
-    locales \
-    && pip3 install black==23.1.0 boto3 codespell==2.2.1 mypy==1.3.0 PyGithub unidiff pylint==2.6.2 \
+        aspell \
+        curl \
+        file \
+        gh \
+        git \
+        libxml2-utils \
+        locales \
+        moreutils \
+        ripgrep \
+        python3-pip \
+        yamllint \
+        zstd \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/* \
-    && rm -rf /root/.cache/pip
+    && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
+
+# python-magic is the same version as in Ubuntu 22.04
+COPY requirements.txt /
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 RUN echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && locale-gen en_US.UTF-8
-ENV LC_ALL en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
 
 # Architecture of the image when BuildKit/buildx is used
 ARG TARGETARCH
@@ -59,5 +63,4 @@ RUN arch=${TARGETARCH:-amd64} \
 
 
 COPY run.sh /
-COPY process_style_check_result.py /
 CMD ["/bin/bash", "/run.sh"]

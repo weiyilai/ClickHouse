@@ -38,8 +38,8 @@ ColumnsDescription StorageSystemRowPolicies::getColumnsDescription()
 
     for (auto filter_type : collections::range(RowPolicyFilterType::MAX))
     {
-        const String & column_name = RowPolicyFilterTypeInfo::get(filter_type).name;
-        description.add({column_name, std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>())});
+        const auto & filter_type_info = RowPolicyFilterTypeInfo::get(filter_type);
+        description.add({filter_type_info.name, std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()), filter_type_info.description});
     }
 
     description.add({"is_restrictive", std::make_shared<DataTypeUInt8>(),
@@ -160,10 +160,10 @@ void StorageSystemRowPolicies::backupData(
 }
 
 void StorageSystemRowPolicies::restoreDataFromBackup(
-    RestorerFromBackup & restorer, const String & /* data_path_in_backup */, const std::optional<ASTs> & /* partitions */)
+    RestorerFromBackup & restorer, const String & data_path_in_backup, const std::optional<ASTs> & /* partitions */)
 {
     auto & access_control = restorer.getContext()->getAccessControl();
-    access_control.restoreFromBackup(restorer);
+    access_control.restoreFromBackup(restorer, data_path_in_backup);
 }
 
 }

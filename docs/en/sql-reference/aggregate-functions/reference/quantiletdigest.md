@@ -1,6 +1,6 @@
 ---
 slug: /en/sql-reference/aggregate-functions/reference/quantiletdigest
-sidebar_position: 207
+sidebar_position: 178
 ---
 
 # quantileTDigest
@@ -55,4 +55,4 @@ Result:
 **See Also**
 
 - [median](../../../sql-reference/aggregate-functions/reference/median.md#median)
-- [quantiles](../../../sql-reference/aggregate-functions/reference/quantiles.md#quantiles)
+- [quantiles](/docs/en/sql-reference/aggregate-functions/reference/quantiles)
