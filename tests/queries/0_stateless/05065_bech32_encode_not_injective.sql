@@ -1,4 +1,4 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, distributed
 -- no-fasttest: bech32Encode is not built in the fast-test build.
 -- https://github.com/ClickHouse/ClickHouse/issues/117201
 -- `bech32Encode` returns an empty string on any encoding error - most easily, data too long for a
@@ -51,3 +51,24 @@ SELECT count() FROM (SELECT sum(v) FROM bech32_partitioned GROUP BY bech32Encode
 SETTINGS allow_aggregate_partitions_independently = 0;
 DROP TABLE bech32_partitioned;
 
+SELECT 'distributed sharding key';
+-- `StorageDistributed::getOptimizedQueryProcessingStageAnalyzer` strips injective functions off the
+-- `GROUP BY`, `DISTINCT` and `LIMIT BY` keys, and when what remains is the sharding key it lets every
+-- shard finish the query on its own, skipping the merge on the initiator. Both shards of
+-- `test_cluster_two_shards` read the same local table, so a query that is wrongly completed
+-- shard-locally returns every group, distinct value or limited row twice.
+DROP TABLE IF EXISTS bech32_local;
+DROP TABLE IF EXISTS bech32_dist;
+CREATE TABLE bech32_local (p String, v UInt64) ENGINE = MergeTree ORDER BY tuple();
+INSERT INTO bech32_local SELECT repeat('x', 60) || toString(number), number FROM numbers(8);
+CREATE TABLE bech32_dist AS bech32_local ENGINE = Distributed(test_cluster_two_shards, currentDatabase(), bech32_local, sipHash64(p));
+SET optimize_skip_unused_shards = 1, optimize_distributed_group_by_sharding_key = 1, optimize_injective_functions_in_limit_by = 0;
+SELECT count() FROM (SELECT sum(v) FROM bech32_dist GROUP BY bech32Encode('bc', p));
+SELECT count() FROM (SELECT DISTINCT bech32Encode('bc', p) FROM bech32_dist);
+SELECT count() FROM (SELECT bech32Encode('bc', p) AS k FROM bech32_dist LIMIT 1 BY k);
+-- The same three queries with the shard-local completion turned off.
+SELECT count() FROM (SELECT sum(v) FROM bech32_dist GROUP BY bech32Encode('bc', p)) SETTINGS optimize_distributed_group_by_sharding_key = 0;
+SELECT count() FROM (SELECT DISTINCT bech32Encode('bc', p) FROM bech32_dist) SETTINGS optimize_distributed_group_by_sharding_key = 0;
+SELECT count() FROM (SELECT bech32Encode('bc', p) AS k FROM bech32_dist LIMIT 1 BY k) SETTINGS optimize_distributed_group_by_sharding_key = 0;
+DROP TABLE bech32_dist;
+DROP TABLE bech32_local;

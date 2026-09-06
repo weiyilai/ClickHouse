@@ -14,3 +14,10 @@ order by truncation
 independent aggregation per partition
 1
 1
+distributed sharding key
+1
+1
+1
+1
+1
+1
