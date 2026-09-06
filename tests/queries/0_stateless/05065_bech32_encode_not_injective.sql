@@ -20,6 +20,9 @@ SELECT count() FROM (SELECT bech32Encode('bc', repeat('x', 60) || toString(numbe
 SELECT 'valid data still round-trips';
 SELECT bech32Decode(bech32Encode('bc', unhex('751e76e8199196d454941c45d1b3a323f1433bd6'), 0)).2 = unhex('751e76e8199196d454941c45d1b3a323f1433bd6');
 
+-- `EXPLAIN QUERY TREE` and the two planner paths tested below exist in the analyzer only.
+SET enable_analyzer = 1;
+
 SELECT 'order by truncation';
 -- `optimize_truncate_order_by_after_group_by_keys` drops the ORDER BY elements after the ones that
 -- cover every `GROUP BY` key, and an injective function of a key covers that key. Dropping the `s`
@@ -47,3 +50,4 @@ SETTINGS allow_aggregate_partitions_independently = 1, force_aggregate_partition
 SELECT count() FROM (SELECT sum(v) FROM bech32_partitioned GROUP BY bech32Encode('bc', p))
 SETTINGS allow_aggregate_partitions_independently = 0;
 DROP TABLE bech32_partitioned;
+
