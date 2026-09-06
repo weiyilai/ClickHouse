@@ -20,6 +20,8 @@ SELECT 'keys present in the dictionary are unaffected';
 SELECT dictGetHierarchy('d_hier', k) AS h, count() FROM (SELECT arrayJoin([toUInt64(1), toUInt64(2)]) AS k) GROUP BY h ORDER BY h;
 
 SELECT 'the function is no longer eliminated from GROUP BY';
+-- `EXPLAIN QUERY TREE` exists only in the analyzer; the result rows above are checked under both analyzers.
+SET enable_analyzer = 1;
 SELECT count() > 0 FROM (EXPLAIN QUERY TREE SELECT dictGetHierarchy('d_hier', k) AS h, count() FROM (SELECT arrayJoin([toUInt64(100), toUInt64(200)]) AS k) GROUP BY h)
 WHERE explain LIKE '%dictGetHierarchy%';
 
