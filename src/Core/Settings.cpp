@@ -9762,10 +9762,21 @@ const ResolvedCompatibilityHistory & getResolvedCompatibilityHistory()
 
 void SettingsImpl::markSettingsChangedByCompatibilityAsUnchanged()
 {
-    for (const auto & setting_name : settings_changed_by_compatibility_setting)
-        markUnchanged(setting_name);
+    if (num_settings_changed_by_compatibility_setting == 0)
+        return;
 
-    settings_changed_by_compatibility_setting.clear();
+    const auto & accessor = Traits::Accessor::instance();
+    for (size_t word = 0; word < num_setting_bitmap_words; ++word)
+    {
+        UInt64 bits = std::exchange(settings_changed_by_compatibility_setting[word], 0);
+        while (bits)
+        {
+            accessor.setValueChanged(*this, word * 64 + std::countr_zero(bits), false);
+            bits &= bits - 1;
+        }
+    }
+
+    num_settings_changed_by_compatibility_setting = 0;
 }
 
 void SettingsImpl::applyCompatibilitySetting(const String & compatibility_value)
